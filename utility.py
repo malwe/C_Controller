@@ -26,14 +26,14 @@ def _leaf_offset(P_LED_ratio):
     return leaf_offset_light_off + (leaf_offst_light_on - leaf_offset_light_off) * P_LED_ratio
 
 
-# Relative humidity (0-100 %) from absolute humidity (g/m^3) and temperature (°C)
+# Relative humidity (0-100 %) from absolute humidity (kg/m^3) and temperature (°C)
 def RH_from_abs_hum(T, w):
-    return w * (273.15 + T) / (6.112 * np.exp(17.67*T/(T+243.5)) * 2.1674)
+    return w * (273.15 + T) / (6.112 * np.exp(17.67*T/(T+243.5)) * 2.1674) * 1000.0
 
 
-# Absolute humidity (g/m^3) from relative humidity (0-100 %) and temperature (°C)
+# Absolute humidity (kg/m^3) from relative humidity (0-100 %) and temperature (°C)
 def abs_hum_from_RH(T, RH):
-    return 6.112 * np.exp(17.67*T/(T+243.5)) * RH * 2.1674 / (273.15 + T)
+    return 6.112 * np.exp(17.67*T/(T+243.5)) * RH * 2.1674 / (273.15 + T) / 1000.0
 
 
 # SVP - Sättigungsdampfdruck (kPa)

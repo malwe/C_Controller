@@ -33,24 +33,34 @@ class GrowZeltSim:
         # k_s = 1/R_s = h_s * A_s
         # k_s = 25 W/(m^2 K)
         # A_s = 1.5 m^2
-        self.k_s = 37.5           # Thermische Kopplung Luft <-> Struktur (W/K)
+        self.k_s_slow = 37.5           # Thermische Kopplung Luft <-> Struktur (W/K)
 
         # sehr grob:
         # C_s = m_s1 * c_s1 + m_s2 * c_s2 + ...
-        # m_s1 = 1 kg (Aluminium), c_s1 = 900 J/(kg K)
-        # m_s2 = 7 kg (Wasser), c_s2 = 4200 J/(kg K)
-        self.C_s = 30000.0        # Wärmekapazität Struktur (J/K)
+        # m_s1 = 12 kg (Wasser), c_s1 = 4200 J/(kg K)
+        self.C_s_slow = 42000.0        # Wärmekapazität Struktur (J/K)
+
+        # sehr grob:
+        # k_s = 1/R_s = h_s * A_s
+        # k_s = 25 W/(m^2 K)
+        # A_s = 15 m^2  (Zeltwände, Pflanzen, flache/dünne Teile allg.)
+        self.k_s_fast = 375           # Thermische Kopplung Luft <-> Struktur (W/K)
+
+        # sehr grob:
+        # C_s = m_s1 * c_s1 + m_s2 * c_s2 + ...
+        # m_s1 = 1 kg (Wasser in Pflanzen), c_s1 = 4200 J/(kg K)
+        # m_s2 = 1 kg (Aluminium), c_s2 = 900 J/(kg K)
+        self.C_s_fast = 5100.0        # Wärmekapazität Struktur (J/K)
         
         self.eta_L = 0.7          # LED-Leistungs Anteil Luft; Rest: Strahlung -> Struktur
   
-        self.V_Lm = 0.07          # max Luftstrom (m^3/s) (nur Rohrventilator angeblich 0,096)
+        self.V_Lm = 0.05          # max Luftstrom (m^3/s) (nur Rohrventilator angeblich 0,096)
         self.n = 1.0              # Exponent Rohrventilator Kennlinie (vermutlich 1...3)
 
-        self.k_trans = 1e-6       # Transpiration scaling
+        self.k_trans = 1e-4       # Transpiration scaling factor (kg/s/kPa)
         self.alpha_trans = 0.01   # Dynamik der Transpiration
 
-        tau_fog = 5.0             # Dynamik Nebel -> Dampf (und Nebler) (s)
-        self.k_fog = 1 / tau_fog  # Dynamik des Nebels (1/s))
+        self.tau_fog = 5.0        # Dynamik Nebel -> Dampf (und Nebler) (s)
 
     # def rough_vpd_approx(self, T, m_H2O):
     #     # sehr vereinfachtes Modell (kein exakter Psychrometrie-Ansatz)
@@ -59,62 +69,77 @@ class GrowZeltSim:
 
     # Dynamik
     def step(self, x, u, z):
-        T_i, T_s, m_H2O_vapor, trans, m_fog = x  # (K) (K) (g) (g/s) (g)
+        T_i, T_s_slow, T_s_fast, m_H2O_vapor, trans, m_fog = x  # (K) (K) (K) (kg) (kg/s) (kg)
         u_f, u_h = u                             # (0-1) (0-1)
-        T_o, w_o, LED = z                        # (K) (g/m^3) (0-1)
+        T_o, w_o, LED = z                        # (K) (kg/m^3) (0-1)
 
         # -------------------------
         # Hilfsgrößen
         # -------------------------
-        Vdot = self.V_Lm * (u_f ** self.n)  # m^3/s
+        Vdot = self.V_Lm * (u_f ** self.n)  # (m^3/s)
 
         c_p = self.c_p
 
         # VPD = self.rough_vpd_approx(T_i, m_H2O)  # (kPa)
-        VPD = leaf_vpd_from_abs_hum(T_i, m_H2O_vapor / self.V, LED)  # (kPa)
-
-        d_eq = self.k_trans * VPD  # Transpirations-Gleichgewicht
+        VPD = max(0.0, leaf_vpd_from_abs_hum(T_i, m_H2O_vapor / self.V, LED))  # (kPa)
+        # REVIEW: Bessere Approximation für Transpiration sinnvoll?
+        trans_eq = self.k_trans * VPD  # Transpirations-Gleichgewicht
 
         # -------------------------
         # Zustand 1: Lufttemperatur im Zelt
         # -------------------------
         Q_vent = self.rho_L * Vdot * c_p * (T_o - T_i)
         Q_wall = (T_o - T_i) / self.R_lambda
-        Q_struct = self.k_s * (T_s - T_i)
+        Q_s_slow = self.k_s_slow * (T_s_slow - T_i)
+        Q_s_fast = self.k_s_fast * (T_s_fast - T_i)
         Q_led_L = self.eta_L * LED * self.P_LED_max
-        Q_hum = - self.r * self.k_fog * m_fog
+        # REVIEW: ist Verdunstung von VPD oder anderer Größe abhängig?
+        fog_evap_factor = VPD / 1.0  # (1) VPD skaliert die Nebelverdunstung (kPa)
+        Q_hum = - self.r * m_fog / self.tau_fog * fog_evap_factor
         Q_trans = - self.r * trans
 
-        dT_i = (Q_vent + Q_wall + Q_struct + Q_led_L + Q_hum + Q_trans) / (self.rho_L * self.V * c_p)
+        dT_i = (Q_vent + Q_wall + Q_s_slow + Q_s_fast + Q_led_L + Q_hum + Q_trans) / (self.rho_L * self.V * c_p)
 
         # -------------------------
-        # Zustand 2: Temperatur wärmeträger Strukturen im Zelt
+        # Zustand 2: Temperatur voluminöser wärmeträger Strukturen im Zelt (Wassertank, Erde)
         # -------------------------
-        dT_s = (-self.k_s * (T_s - T_i) + (1 - self.eta_L) * LED * self.P_LED_max) / self.C_s
+        dT_s_slow = (-self.k_s_slow * (T_s_slow - T_i) + (1 - self.eta_L) * LED * self.P_LED_max) / self.C_s_slow
 
         # -------------------------
-        # Zustand 3: Masse Wasserdampf im Zelt
+        # Zustand 3: Temperatur flächiger wärmeträger Strukturen im Zelt (Zeltwände, Pflanzen, ...)
         # -------------------------
-        w_i = m_H2O_vapor / self.V  # absolute Feuchte (g/m^3)
-        dm = Vdot * (w_o - w_i) + self.k_fog * m_fog + trans  # (g/s)
+        dT_s_fast = (-self.k_s_fast * (T_s_fast - T_i) + (1 - self.eta_L) * LED * self.P_LED_max) / self.C_s_fast
 
         # -------------------------
-        # Zustand 4: Transpiration dynamisch
+        # Zustand 4: Masse Wasserdampf im Zelt
         # -------------------------
-        dd = -self.alpha_trans * (trans - d_eq)  # (g/s^2)
+        w_i = m_H2O_vapor / self.V  # absolute Feuchte (kg/m^3)
+        dm_H2O_vapor = Vdot * (w_o - w_i) + m_fog / self.tau_fog + trans  # (kg/s)
 
         # -------------------------
-        # Zustand 5: Nebel in Luft (noch als Tropfen, nicht als Dampf) - Annahme: PT1
+        # Zustand 5: Transpiration dynamisch
         # -------------------------
-        dm_fog = self.H * u_h - self.k_fog * m_fog  # (g/s)
+        dd = - self.alpha_trans * (trans - trans_eq)  # (kg/s^2)
+
+        # -------------------------
+        # Zustand 6: Nebel in Luft (noch als Tropfen, nicht als Dampf) - Annahme: PT1
+        # -------------------------
+        # -Vdot*m_fog/self.V -> Nebel wird durch Abluft entfernt
+        # Praktisch ist die Abluft aber weit vom Nebel entfernt -> evtl. wieder entfernen?
+        dm_fog = self.H * u_h - m_fog / self.tau_fog - Vdot * m_fog / self.V  # (kg/s)
 
         # -------------------------
         # Euler Vorwärts-Integration
         # -------------------------
         T_i += self.dt * dT_i
-        T_s += self.dt * dT_s
-        m_H2O_vapor += self.dt * dm
+        T_s_slow += self.dt * dT_s_slow
+        T_s_fast += self.dt * dT_s_fast 
+        m_H2O_vapor += self.dt * dm_H2O_vapor
         trans += self.dt * dd
         m_fog += self.dt * dm_fog
 
-        return np.array([T_i, T_s, m_H2O_vapor, trans, m_fog])
+        m_H2O_vapor = max(0.0, m_H2O_vapor)
+        trans = max(0.0, trans)
+        m_fog = max(0.0, m_fog)
+
+        return np.array([T_i, T_s_slow, T_s_fast, m_H2O_vapor, trans, m_fog])
