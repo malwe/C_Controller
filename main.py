@@ -2,7 +2,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 from enum import Enum
 
-from GrowZeltSim import GrowZeltSim
+from TentDynamics import GrowZeltSim
 from SensorDynamics import SensorDynamics
 from utility import RH_from_abs_hum, abs_hum_from_RH
 
