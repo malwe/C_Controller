@@ -4,17 +4,21 @@ from enum import Enum
 
 from TentDynamics import GrowZeltSim
 from SensorDynamics import SensorDynamics
-from utility import RH_from_abs_hum, abs_hum_from_RH, atmospheric_vpd_from_RH
+from utility import RH_from_abs_hum, abs_hum_from_RH, atmospheric_vpd_from_RH, RH_from_VPD_and_temp
 from controller import Controller
+from shared import *
 
 
-DT = 0.2  # Zeitschritt der Simulation (s)
+# Es muss mindestens gelten für Euler-Integration: DT / tau_min < 0.3
+# EMA: T_sampling = 0.2 s ; alpha = 0.1 => tau_EMA = -T_sampling/ln(1 - alpha) = 1.9 s
+# => DT < 0.57
+DT = 0.25  # Zeitschritt der Simulation (s)
 
 sim = GrowZeltSim(DT)
 
 # tau_T_sensor und tau_RH_sensor frei geschätzt
-tau_T_sensor = 15.0   # (s)
-tau_RH_sensor = 15.0  # (s)
+tau_T_sensor = 10.0   # (s)
+tau_RH_sensor = 10.0  # (s)
 # EMA-Filter:
 # y[i] = α x[i] + (1−α) y[i−1]
 # Y(z) = α X(z) + (1−α) z^−1 Y(z)
@@ -79,13 +83,18 @@ class HistoryRows(Enum):
     RH_i = 11
     VPD_atm_i = 12
     VPD_atm_meas = 13
+    trans = 14
+    evap = 15
     #
-    LENGTH_PLUS_ONE = 14
+    LENGTH_PLUS_ONE = 16
 
 history = np.zeros((HistoryRows.LENGTH_PLUS_ONE.value, N))  # Zeilen: Historie der Größen, Spalten: Zeitschritte
 
 
 controller = Controller(DT)
+
+trans = float('NaN')
+evap = float('NaN')
 
 # -------------------------
 # Simulation
@@ -114,69 +123,146 @@ for k in range(N):
     u_f[k], u_h[k] = u
 
     # Historie speichern
-    history[:, k] = [T_i, T_s_slow, T_s_fast, m_H2O_vapor, Gc, m_fog, u_f[k], u_h[k], T_meas, RH_meas, w_i, RH_i, VPD_atm_i, VPD_atm_meas]
+    history[:, k] = [T_i, T_s_slow, T_s_fast, m_H2O_vapor, Gc, m_fog, u_f[k], u_h[k], T_meas, RH_meas, w_i, RH_i, VPD_atm_i, VPD_atm_meas, trans, evap]
 
     # Simulation des nächsten Zeitschritts
-    x = sim.step(x, u, z)  # x[k], u[k], z[k] -> x[k+1] 
+    x, [trans, evap] = sim.step(x, u, z)  # x[k], u[k], z[k] -> x[k+1] 
 
 
 # -------------------------
 # Plot
 # -------------------------
 t = np.arange(N) * DT
-fig, axes = plt.subplots(
-    5,
-    1,
-    sharex=True,
-    figsize=(14, 9),
-    gridspec_kw={"height_ratios": [1, 3, 3, 3, 3], "hspace": 0.05},
-)
-fig.subplots_adjust(left=0.05, right=0.99, top=0.98, bottom=0.05)
 
-# Plot 1: Steuergrößen u_f, u_h & Störgröße LED
-axes[0].plot(t, history[HistoryRows.u_f.value, :], label='u_f', color='tab:blue')
-axes[0].plot(t, history[HistoryRows.u_h.value, :], label='u_h', color='tab:orange')
-axes[0].plot(t, LED, label='LED', color='tab:green')
-axes[0].set_ylabel('Actuators & LED')
-axes[0].legend(loc='upper right')
-axes[0].grid(True, linestyle=':', alpha=0.5)
+# Zwei separate GridSpecs: links für 1D-Plots (75%), rechts für 2D-Plots (25%)
+fig = plt.figure(figsize=(18, 12))
 
-# Plot 2: Temperaturen
-axes[1].plot(t, history[HistoryRows.T_i.value, :], label='T_i', color='tab:red', linestyle='--')
-axes[1].plot(t, T_o, label='T_o', color='tab:cyan', linestyle=':')
-axes[1].plot(t, history[HistoryRows.T_s_slow.value, :], label='T_s_slow', color='tab:purple')
-axes[1].plot(t, history[HistoryRows.T_s_fast.value, :], label='T_s_fast', color='tab:pink')
-axes[1].plot(t, history[HistoryRows.T_meas.value, :], label='T_meas', color='tab:gray')
-axes[1].set_ylabel('Temperature (°C)')
-axes[1].legend(loc='upper right')
-axes[1].grid(True, linestyle=':', alpha=0.5)
+# Linke GridSpec: num_left_plots Zeilen für 1D-Plots
+num_left_plots = 5
+gs_left = fig.add_gridspec(num_left_plots, 1, left=0.03, right=0.72, top=0.98, bottom=0.03, 
+                           hspace=0.07, height_ratios=[1, 3, 3, 3, 3],)
 
-# Plot 3: Relative Luftfeuchtigkeiten
-axes[2].plot(t, history[HistoryRows.RH_i.value, :], label='RH_i', color='tab:blue', linestyle='--')
-axes[2].plot(t, RH_o, label='RH_o', color='tab:cyan', linestyle=':')
-axes[2].plot(t, history[HistoryRows.RH_meas.value, :], label='RH_meas', color='tab:orange')
-axes[2].set_ylabel('RH (%)')
-axes[2].legend(loc='upper right')
-axes[2].grid(True, linestyle=':', alpha=0.5)
+# Rechte GridSpec: 2 Zeilen für 2D-Plots (jeder bekommt volle Höhe)
+gs_right = fig.add_gridspec(2, 1, left=0.75, right=0.99, top=0.95, bottom=0.4, 
+                            hspace=0.15)
 
-# Plot 4: Absolute Feuchten und Wassermassen
-axes[3].plot(t, w_o, label='w_o', color='tab:cyan', linestyle='--')
-axes[3].plot(t, history[HistoryRows.w_i.value, :], label='w_i', color='tab:blue')
-axes[3].plot(t, history[HistoryRows.m_H2O_vapor.value, :], label='m_H2O_vapor', color='tab:green')
-axes[3].plot(t, history[HistoryRows.m_fog.value, :], label='m_fog', color='tab:brown')
-axes[3].plot(t, history[HistoryRows.Gc.value, :]*history[HistoryRows.VPD_atm_i.value, :]*1000.0, label='trans (g/s)', color='tab:orange')
-axes[3].set_ylabel('Humidity (kg/m^3) / mass (kg)')
-axes[3].set_xlabel('Time (s)')
-axes[3].legend(loc='upper right')
-axes[3].grid(True, linestyle=':', alpha=0.5)
+# 1D-Plots auf der linken Seite
+axes_1d = []
+for i in range(num_left_plots):
+    if i == 0:
+        axes_1d.append(fig.add_subplot(gs_left[i]))
+    else:
+        axes_1d.append(fig.add_subplot(gs_left[i], sharex=axes_1d[0]))
 
-# Plot 4: Sonstiges
-axes[4].plot(t, history[HistoryRows.VPD_atm_i.value, :], label='VPD_atm_i', color='tab:gray', linestyle='--')
-axes[4].plot(t, history[HistoryRows.VPD_atm_meas.value, :], label='VPD_atm_meas', color='tab:blue')
-axes[4].plot(t, history[HistoryRows.Gc.value, :]*1000.0, label='Gc (g/s/kPa)', color='tab:orange')
-axes[4].set_ylabel('Other')
-axes[4].set_xlabel('Time (s)')
-axes[4].legend(loc='upper right')
-axes[4].grid(True, linestyle=':', alpha=0.5)
+# 2D-Plots auf der rechten Seite
+ax_2d_upper = fig.add_subplot(gs_right[0])
+ax_2d_lower = fig.add_subplot(gs_right[1])
+
+# Plot 1D: Steuergrößen u_f, u_h & Störgröße LED
+axes_1d[0].plot(t, LED, label='LED', color='tab:orange')
+axes_1d[0].plot(t, history[HistoryRows.u_f.value, :], label='u_f', color='tab:gray')
+axes_1d[0].plot(t, history[HistoryRows.u_h.value, :], label='u_h', color='tab:blue')
+axes_1d[0].set_ylabel('Actuators & LED')
+axes_1d[0].legend(loc='upper right', fontsize='small')
+axes_1d[0].grid(True, linestyle=':', alpha=0.5)
+
+# Plot 1D: Temperaturen
+axes_1d[1].plot(t, history[HistoryRows.T_i.value, :], label='T_i', color='tab:red', linestyle='--')
+axes_1d[1].plot(t, T_o, label='T_o', color='tab:cyan', linestyle=':')
+axes_1d[1].plot(t, history[HistoryRows.T_s_slow.value, :], label='T_s_slow', color='tab:purple')
+axes_1d[1].plot(t, history[HistoryRows.T_s_fast.value, :], label='T_s_fast', color='tab:pink')
+axes_1d[1].plot(t, history[HistoryRows.T_meas.value, :], label='T_meas', color='tab:gray')
+axes_1d[1].set_ylabel('Temperature (°C)')
+axes_1d[1].legend(loc='upper right', fontsize='small')
+axes_1d[1].grid(True, linestyle=':', alpha=0.5)
+
+# Plot 1D: Relative Luftfeuchtigkeiten
+axes_1d[2].plot(t, history[HistoryRows.RH_i.value, :], label='RH_i', color='tab:blue', linestyle='--')
+axes_1d[2].plot(t, RH_o, label='RH_o', color='tab:cyan', linestyle=':')
+axes_1d[2].plot(t, history[HistoryRows.RH_meas.value, :], label='RH_meas', color='tab:orange')
+axes_1d[2].set_ylabel('RH (%)')
+axes_1d[2].legend(loc='upper right', fontsize='small')
+axes_1d[2].grid(True, linestyle=':', alpha=0.5)
+
+# Plot 1D: Absolute Feuchten und Wassermassen
+axes_1d[3].plot(t, w_o, label='w_o (kg/m^3)', color='tab:cyan', linestyle=':')
+axes_1d[3].plot(t, history[HistoryRows.w_i.value, :], label='w_i (kg/m^3)', color='tab:blue')
+axes_1d[3].plot(t, history[HistoryRows.m_fog.value, :], label='m_fog (kg)', color='tab:brown')
+axes_1d[3].plot(t, history[HistoryRows.trans.value, :]*1000.0, label='trans (g/s)', color='tab:orange')
+axes_1d[3].set_ylabel('Humidity / mass')
+axes_1d[3].legend(loc='upper right', fontsize='small')
+axes_1d[3].grid(True, linestyle=':', alpha=0.5)
+
+# Plot 1D: VPD und Gc
+axes_1d[4].plot(t, history[HistoryRows.VPD_atm_i.value, :], label='VPD_atm_i (kPa)', color='tab:gray', linestyle='--')
+axes_1d[4].plot(t, history[HistoryRows.VPD_atm_meas.value, :], label='VPD_atm_meas (kPa)', color='tab:blue')
+axes_1d[4].plot(t, history[HistoryRows.Gc.value, :]*1000.0, label='Gc (g/s/kPa)', color='tab:orange')
+axes_1d[4].set_ylabel('Other')
+axes_1d[4].legend(loc='upper right', fontsize='small')
+axes_1d[4].grid(True, linestyle=':', alpha=0.5)
+
+axes_1d[num_left_plots - 1].set_xlabel('Time (s)')
+
+# x-Achsen-Ziffern nur beim untersten Plot anzeigen
+for i in range(num_left_plots - 1):
+    axes_1d[i].tick_params(labelbottom=False)
+
+# Grenzkurven für VPD berechnen
+T_range = np.linspace(20, 30, 100)
+RH_from_VPD_MIN = RH_from_VPD_and_temp(VPD_MIN, T_range)
+RH_from_VPD_MAX = RH_from_VPD_and_temp(VPD_MAX, T_range)
+
+# Plot 2D oben: (RH_i, T_i)
+line_2d_upper, = ax_2d_upper.plot(history[HistoryRows.RH_i.value, :], history[HistoryRows.T_i.value, :], 
+                 color='tab:red', linewidth=1.5, label='(RH_i, T_i)')
+ax_2d_upper.plot(RH_from_VPD_MIN, T_range, color='green', linestyle=':', linewidth=1.0, label=f'VPD_MIN ({VPD_MIN} kPa)')
+ax_2d_upper.plot(RH_from_VPD_MAX, T_range, color='green', linestyle=':', linewidth=1.0, label=f'VPD_MAX ({VPD_MAX} kPa)')
+ax_2d_upper.set_xlim(30, 80)
+ax_2d_upper.set_ylim(20, 30)
+ax_2d_upper.set_ylabel('T (°C)')
+ax_2d_upper.set_title('RH_i vs T_i', fontsize='small', fontweight='bold')
+ax_2d_upper.grid(True, linestyle=':', alpha=0.5)
+ax_2d_upper.legend(fontsize='small', loc='upper left')
+
+# Plot 2D unten: (RH_meas, T_meas)
+line_2d_lower, = ax_2d_lower.plot(history[HistoryRows.RH_meas.value, :], history[HistoryRows.T_meas.value, :], 
+                 color='tab:orange', linewidth=1.5, label='(RH_meas, T_meas)')
+ax_2d_lower.plot(RH_from_VPD_MIN, T_range, color='green', linestyle=':', linewidth=1.0, label=f'VPD_MIN ({VPD_MIN} kPa)')
+ax_2d_lower.plot(RH_from_VPD_MAX, T_range, color='green', linestyle=':', linewidth=1.0, label=f'VPD_MAX ({VPD_MAX} kPa)')
+ax_2d_lower.set_xlim(30, 80)
+ax_2d_lower.set_ylim(20, 30)
+ax_2d_lower.set_xlabel('RH (%)')
+ax_2d_lower.set_ylabel('T (°C)')
+ax_2d_lower.set_title('RH_meas vs T_meas', fontsize='small', fontweight='bold')
+ax_2d_lower.grid(True, linestyle=':', alpha=0.5)
+ax_2d_lower.legend(fontsize='small', loc='upper left')
+
+# Callback: Wenn x-Limits sich ändern, filtere die 2D-Plots
+def on_xlim_change(event):
+    xmin, xmax = axes_1d[0].get_xlim()
+    
+    # Konvertiere Zeit zu Indizes
+    idx_min = int(max(0, xmin / DT))
+    idx_max = int(min(N, xmax / DT))
+    
+    # Filtere Daten für den Bereich
+    idx_slice = slice(idx_min, idx_max)
+    
+    # Update 2D oben (RH_i, T_i)
+    line_2d_upper.set_data(
+        history[HistoryRows.RH_i.value, idx_slice],
+        history[HistoryRows.T_i.value, idx_slice]
+    )
+    
+    # Update 2D unten (RH_meas, T_meas)
+    line_2d_lower.set_data(
+        history[HistoryRows.RH_meas.value, idx_slice],
+        history[HistoryRows.T_meas.value, idx_slice]
+    )
+    
+    fig.canvas.draw_idle()
+
+# Registriere Callback
+axes_1d[0].callbacks.connect('xlim_changed', on_xlim_change)
 
 plt.show()

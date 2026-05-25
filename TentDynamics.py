@@ -54,7 +54,7 @@ class GrowZeltSim:
         self.C_s_fast = 5100.0        # Wärmekapazität Struktur (J/K)
         
         self.eta_L = 0.7          # LED-Leistungs Anteil Luft
-        self.eta_s_fast = 0.25    # LED-Leistungs Anteil Zeltwand, Pflanzen
+        self.eta_s_fast = 0.25    # LED-Leistungs Anteil Zeltwand, Pflanzen, Lampe selbst
         self.eta_s_slow = 0.05    # LED-Leistungs Anteil Wassertank, Erde
         assert(self.eta_L + self.eta_s_fast + self.eta_s_slow == 1.0)
   
@@ -65,16 +65,35 @@ class GrowZeltSim:
         # self.k_trans = 1.2e-5   # Transpiration pro VPD (kg/s/kPa) (hier 1kg/d bei 1kPa VPD)
 
         # Neues Modell Transpiration
+        # Bisher keine Berücksichtigung der Windgeschwindigkeit (z.B. Ventilator {0, 1})
         self.tau_Gc = 20*60       # Dynamik der canopy conductance (s)
-        self.Gc_ratio_no_light = 0.15  # (canopy conductance dunkel) / (canopy conductance hell)
+        self.Gc_ratio_no_light = 0.15  # (canopy conductance dunkel) / (canopy conductance hell) (1)
         self.K_half = 250         # (umol/m^2/s) (Bereich 200...300 gut belegt, am besten konstant lassen)
         self.PPFD_MAX = 700       # grob geschätzt (nochmal prüfen) (umol/m^2/s)
-        self.Gc_max = 1e-5        # canopy conductance (bezogen auf self.A) (kg/s/kPa)
+        self.Gc_max = 1e-5        # canopy conductance bei Gc_bezug (kg/s/kPa)
         self.Gc_VPD_g1 = 4        # VPD Abhängigkeit der canopy conductance (sqrt(kPa))
-        Gc_bezug = 1.0
-        self.Gc_norm = (1 + self.Gc_VPD_g1 / np.sqrt(Gc_bezug))
+        Gc_bezugs_VPD = 1.0       # Bezugs-VPD für Initialisierung von Gc_max (kPa)
+        self.Gc_norm = (1 + self.Gc_VPD_g1 / np.sqrt(Gc_bezugs_VPD))
 
-        self.tau_fog = 5.0        # Dynamik (Nebler->) Nebel -> Dampf bei VPD=1kPa(s)
+        # https://www.sciencedirect.com/science/article/pii/S0304380025001188
+        felt_evap_ratio = 0.15    # Verdunstung durch Topfmantel (bei Filz) vs. Verdunstung von Erdoberfläche (1)
+        num_pots = 2              # Anzahl Pflanztöpfe (1)
+        pot_diameter = 0.35       # (m)
+        pot_fill_height = 0.25    # (m)
+        pi = 3.14159
+        earth_humidity = 0.5      # (0-1)
+        A_evap = num_pots * (pi * (pot_diameter/2)**2 + felt_evap_ratio * pi * pot_diameter * pot_fill_height)
+        # Modell lässt sich durch Umschalten von self.k_evap um Ventilator {0, 1} erweitern
+        # Dazu muss z.B. Jacobian in EKF:
+        # devap/dk_evap_vent_off = { vent=1: 0 ; vent=0: VPD }
+        # devap/dk_evap_vent_on  = { vent=1: VPD ; vent=0: 0 }
+        # h_v_vent_off = 3        # (mm/s) (2...5 bei fast keinem Wind)
+        h_v_vent_on  = 12         # (mm/s) (ca. 20 bei überall 3 m/s Wind)
+        # self.k_evap_vent_off = earth_humidity * h_v_vent_off * 7.26 * 10**(-7) * A_evap  # (kg/s/kPa)
+        self.k_evap_vent_on  = earth_humidity * h_v_vent_on  * 7.26 * 10**(-7) * A_evap  # (kg/s/kPa)
+        self.k_evap = self.k_evap_vent_on  # Später evtl. umschaltbar - Parameterschätzer auf k_evap_vent_on und k_evap_vent_off
+
+        self.tau_fog = 5.0        # Dynamik (Nebler->) Nebel -> Dampf bei VPD=1kPa (s)
 
         self.T_gradient_offset = 1.0   # Abluft saugt warme Luft oben aus Zelt: T_i+T_gradient_offset (K)
 
@@ -97,11 +116,14 @@ class GrowZeltSim:
         # VPD = self.rough_vpd_approx(T_i, m_H2O)  # (kPa)
         VPD = max(0.0, leaf_vpd_from_abs_hum(T_i, m_H2O_vapor / self.V, LED))  # (kPa)
 
-        # REVIEW: ist Verdunstung von VPD oder anderer Größe abhängig?
+        # REVIEW: ist Verdunstung der Nebeltropfen/ Aerosole so grob richtig skaliert?
         fog_evap_factor = VPD / 1.0  # (1) VPD skaliert die Nebelverdunstung (kPa)
 
-        # Verdunstung ist canopy conductance (bezogen auf Growfläche) * VPD
+        # Transpiration (kg/s) (der Pflanzen) ist canopy conductance (bezogen auf Growfläche) * VPD
         trans = Gc * VPD
+
+        # Verdunstung (kg/s) (von Erde und offenen Wasserflächen)
+        evap = self.k_evap * VPD
 
         # -------------------------
         # Zustand 1: Lufttemperatur im Zelt
@@ -113,8 +135,9 @@ class GrowZeltSim:
         Q_led_L = self.eta_L * LED * self.P_LED_max
         Q_hum = - self.r * m_fog / self.tau_fog * fog_evap_factor
         Q_trans = - self.r * trans
+        Q_evap = - self.r * evap
 
-        dT_i = (Q_vent + Q_wall + Q_s_slow + Q_s_fast + Q_led_L + Q_hum + Q_trans) / (self.rho_L * self.V * self.c_p)
+        dT_i = (Q_vent + Q_wall + Q_s_slow + Q_s_fast + Q_led_L + Q_hum + Q_trans + Q_evap) / (self.rho_L * self.V * self.c_p)
 
         # -------------------------
         # Zustand 2: Temperatur voluminöser wärmeträger Strukturen im Zelt (Wassertank, Erde)
@@ -130,7 +153,7 @@ class GrowZeltSim:
         # Zustand 4: Masse Wasserdampf im Zelt
         # -------------------------
         w_i = m_H2O_vapor / self.V  # absolute Feuchte (kg/m^3)
-        dm_H2O_vapor = Vdot * (w_o - w_i) + m_fog / self.tau_fog + trans  # (kg/s)
+        dm_H2O_vapor = Vdot * (w_o - w_i) + m_fog / self.tau_fog + trans + evap  # (kg/s)
 
         # -------------------------
         # Zustand 5: Transpiration dynamisch
@@ -169,4 +192,4 @@ class GrowZeltSim:
         trans = max(0.0, trans)
         m_fog = max(0.0, m_fog)
 
-        return np.array([T_i, T_s_slow, T_s_fast, m_H2O_vapor, Gc, m_fog])
+        return [[T_i, T_s_slow, T_s_fast, m_H2O_vapor, Gc, m_fog], [trans, evap]]  # x[k+1], abgeleitete_Groeßen[k+1]

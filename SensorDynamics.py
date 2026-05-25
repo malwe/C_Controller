@@ -1,4 +1,6 @@
-# Sensor <-> Umgebung physikalisch PT1 und EMA-Filter PT1    => PT2 gesamt
+# Sensor <-> Umgebung physikalisch PT1
+# In Reihe dazu: EMA-Filter = PT1 (in etwa)
+# => PT2 gesamt
 
 
 class SensorDynamics:
