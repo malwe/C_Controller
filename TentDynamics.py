@@ -3,6 +3,40 @@ import numpy as np
 from utility import leaf_vpd_from_abs_hum
 
 
+# Vereinfachungen
+
+# - Luft im Zelt wird in Simulation als instantan vollständig durchmischt angenommen
+#   -> Dadurch z.B. kein Temperatur-, Feuchte-, VPD-Gradient unten/oben
+#      - Ausnahme: Bei Abluft wird Temperatur der abgesaugten Luft als T_i+T_gradient_offset angenommen
+#   -> Kein 'Dynamisches Verhalten' bei Abluft und Humidifier
+#   - Vernachlässigt weil: Schwierige Simulation
+
+# - Abluft hat Soft Start durch Motorsteuerung
+#   -> bei harten Sprüngen in u_f wird dynamisches Verhalten nicht modelliert
+#   - Vernachlässigt weil: - Sind die Zeitkonstanten im Zelt nicht viel größer und damit der Effekt hier klein?
+#                          - Unbekanntes Soft-Start-Verhalten
+
+# - Abluft erhöht Luftbewegung im Zelt und damit Konvektion an Oberflächen
+#   -> Kopplungen von Strukturen und Lufttem. nehmen zu
+#   -> R_lambda nimmt ab
+#   -> Transpiration nimmt zu (?)
+#   -> Evaporatioin nimmt zu
+#   -> tau_fog nimmt ab
+#   - Vernachlässigt weil: Luftbewegung durch Abluft << Luftbewegung durch Ventilator
+
+# - Ventilator auschaltbar (jetzt: immer an)
+#   -> Kopplungen von Strukturen und Lufttemp. nehmen ab
+#   -> R_lambda nimmt zu
+#   -> Transpiration nimmt ab (?)
+#   -> Evaporation nimmt ab
+#   -> tau_fog nimmt zu
+#   - Vernachlässigt weil: Bisher Ventilator immer an
+
+# - Humidifier erzeugt Abwärme in Nebel, Luft und Wassertank
+#   - Teilweise grob umgesetzt durch Q_hum_air = P_hum_air_factor * P_hum_max * u_h
+#   - Der Rest müsste modelliert werden als übergehend in den Humidifier (Gerät+Wassertank)
+
+
 class GrowZeltSim:
     def __init__(self, dt=1.0):
         self.dt = dt
@@ -14,10 +48,10 @@ class GrowZeltSim:
 
         # Konstante Modellparameter
         self.V = 1.15             # Zeltvolumen (m^3)
-        self.A = 0.64             # Zeltfläche (m^2)
         self.H = 0.000061         # Humidifier (kg/s) max (220 g/h)
         self.V_Lm = 0.08          # max Luftstrom (m^3/s) (nur Rohrventilator angeblich 0,096)
         self.P_LED_max = 220.0    # max LED-Leistung (W)
+        self.P_hum_max = 25.0     # max el. Leistung des Humidifiers (W)
 
         # Modellparameter - später adaptive Schätzung
 
@@ -28,6 +62,7 @@ class GrowZeltSim:
         # h_i = 25 W/(m^2 K)
         # h_a = 3 W/(m^2 K)
         # U_zeltwand > 1000 W/(m^2 K) -> irrelevant
+        # Falls Ventilator geschaltet werden soll muss R_lambda analog k_evap umgeschaltet werden
         self.R_lambda = 0.06      # Wärmeübergang- & durchgang durch Zeltwand (K/W)
 
         # sehr grob:
@@ -56,7 +91,7 @@ class GrowZeltSim:
         self.eta_L = 0.7          # LED-Leistungs Anteil Luft
         self.eta_s_fast = 0.25    # LED-Leistungs Anteil Zeltwand, Pflanzen, Lampe selbst
         self.eta_s_slow = 0.05    # LED-Leistungs Anteil Wassertank, Erde
-        assert(self.eta_L + self.eta_s_fast + self.eta_s_slow == 1.0)
+        assert(abs(self.eta_L + self.eta_s_fast + self.eta_s_slow - 1) < 1e-9)
   
         self.V_Lm = 0.05          # max Luftstrom (m^3/s) (nur Rohrventilator angeblich 0,096)
         self.n = 1.0              # Exponent Rohrventilator Kennlinie (vermutlich 1...3)
@@ -95,6 +130,8 @@ class GrowZeltSim:
 
         self.tau_fog = 5.0        # Dynamik (Nebler->) Nebel -> Dampf bei VPD=1kPa (s)
 
+        self.P_hum_air_ratio = 0.5  # (0-1) Anteil der Leistung des Humidifiers welche direkt in die Luft abgegeben wird
+
         self.T_gradient_offset = 1.0   # Abluft saugt warme Luft oben aus Zelt: T_i+T_gradient_offset (K)
 
     # def rough_vpd_approx(self, T, m_H2O):
@@ -117,7 +154,8 @@ class GrowZeltSim:
         VPD = max(0.0, leaf_vpd_from_abs_hum(T_i, m_H2O_vapor / self.V, LED))  # (kPa)
 
         # REVIEW: ist Verdunstung der Nebeltropfen/ Aerosole so grob richtig skaliert?
-        fog_evap_factor = VPD / 1.0  # (1) VPD skaliert die Nebelverdunstung (kPa)
+        fog_evap_factor = VPD / 1.0  # (1) VPD skaliert die Nebelverdunstung
+        fog_evap = m_fog / self.tau_fog * fog_evap_factor  # (kg/s)
 
         # Transpiration (kg/s) (der Pflanzen) ist canopy conductance (bezogen auf Growfläche) * VPD
         trans = Gc * VPD
@@ -133,11 +171,12 @@ class GrowZeltSim:
         Q_s_slow = self.k_s_slow * (T_s_slow - T_i)
         Q_s_fast = self.k_s_fast * (T_s_fast - T_i)
         Q_led_L = self.eta_L * LED * self.P_LED_max
-        Q_hum = - self.r * m_fog / self.tau_fog * fog_evap_factor
+        Q_fog_evap = - self.r * fog_evap
         Q_trans = - self.r * trans
         Q_evap = - self.r * evap
+        Q_hum_air = self.P_hum_air_ratio * self.P_hum_max * u_h
 
-        dT_i = (Q_vent + Q_wall + Q_s_slow + Q_s_fast + Q_led_L + Q_hum + Q_trans + Q_evap) / (self.rho_L * self.V * self.c_p)
+        dT_i = (Q_vent + Q_wall + Q_s_slow + Q_s_fast + Q_led_L + Q_fog_evap + Q_trans + Q_evap + Q_hum_air) / (self.rho_L * self.V * self.c_p)
 
         # -------------------------
         # Zustand 2: Temperatur voluminöser wärmeträger Strukturen im Zelt (Wassertank, Erde)
@@ -162,6 +201,7 @@ class GrowZeltSim:
         # https://www.implexx.io/manuals-and-guides/how-to-measure-canopy-stomatal-conductance/
         # https://www.sciencedirect.com/science/article/pii/S0304380025001188
         # https://nph.onlinelibrary.wiley.com/doi/10.1111/nph.16485
+        # (Selbst) modifiziertes Medlyn USO-Modell
         PPFD = LED * self.PPFD_MAX  # Photosynthetically Active Photon Flux Density (µmol/m^2/s)
         Gc_VPD_abhaengigkeit = 1 + self.Gc_VPD_g1 / max(0.01, np.sqrt(VPD))
         Gc_steady = self.Gc_max/self.Gc_norm * (self.Gc_ratio_no_light + (1 - self.Gc_ratio_no_light) * PPFD / (PPFD + self.K_half)) * Gc_VPD_abhaengigkeit
@@ -175,7 +215,7 @@ class GrowZeltSim:
         # -------------------------
         # -Vdot*m_fog/self.V -> Nebel wird durch Abluft entfernt
         # Praktisch ist die Abluft aber weit vom Nebel entfernt -> evtl. wieder entfernen?
-        dm_fog = self.H * u_h - m_fog / self.tau_fog * fog_evap_factor - Vdot * m_fog / self.V  # (kg/s)
+        dm_fog = self.H * u_h - fog_evap - Vdot * m_fog / self.V  # (kg/s)
 
         # -------------------------
         # Euler Vorwärts-Integration
