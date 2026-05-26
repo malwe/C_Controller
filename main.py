@@ -1,5 +1,6 @@
 import matplotlib.pyplot as plt
 import numpy as np
+from scipy.ndimage import gaussian_filter
 from enum import Enum
 
 from TentDynamics import GrowZeltSim
@@ -38,7 +39,7 @@ sensor.init(T0=25.0, RH0=50.0)
 x = np.array([25.0, 25.0, 25.0, 0.015, 0.0, 0.0])  # T_i, T_s_slow, T_s_fast, m_H2O_vapor(kg), Gc(kg/s/kPa), m_fog(kg)
 
 # Zeitreihe
-simulation_duration = 5 * 3600.0  # s
+simulation_duration = 10 * 3600.0  # s
 N = int(simulation_duration / DT)
 
 # Störgrößen (erstmal hardcoded, später Messwerte & (Kalman-)Filter)
@@ -112,9 +113,9 @@ for k in range(N):
     # Stellgrößen (hardcoded)
     # u = [u_f[k], u_h[k]]
     # Stellgrößen (Regler)
-    # u = controller.bang_bang(T_meas, VPD_atm_meas)  # u[k]
-    u_f, u_h = controller.plgs(T_meas, VPD_atm_meas)  # u[k]
-    # u_f, u_h, I_f_T, I_f_vpd, I_h_vpd = controller.PI_T_and_PI_VPD(T_meas, VPD_atm_meas)  # u[k]
+    # u_f, u_h = controller.bang_bang(T_meas, VPD_atm_meas)  # u[k]
+    # u_f, u_h = controller.plgs(T_meas, VPD_atm_meas)  # u[k]
+    u_f, u_h, I_f_T, I_f_vpd, I_h_vpd = controller.PI_T_and_PI_VPD(T_meas, VPD_atm_meas)  # u[k]
     u = [u_f, u_h]
 
     # Historie speichern
@@ -216,14 +217,36 @@ axes_1d[num_left_plots - 1].set_xlabel('Time (s)')
 for i in range(num_left_plots - 1):
     axes_1d[i].tick_params(labelbottom=False)
 
+
+
 # Grenzkurven für VPD berechnen
 T_range = np.linspace(20, 30, 100)
 RH_from_VPD_MIN = RH_from_VPD_and_temp(VPD_MIN, T_range)
 RH_from_VPD_MAX = RH_from_VPD_and_temp(VPD_MAX, T_range)
 
 # Plot 2D oben: (RH_i, T_i)
+RH_i_plot = history[HistoryRows.RH_i.value, first:]
+T_i_plot = history[HistoryRows.T_i.value, first:]
+heatmap, xedges, yedges = np.histogram2d(
+    RH_i_plot,
+    T_i_plot,
+    bins=250,
+    range=[[30, 80], [20, 30]]
+)
+heatmap = gaussian_filter(heatmap, sigma=5.0)
+heatmap = heatmap / np.max(heatmap)
+alpha_map = heatmap.copy()
+alpha_map = alpha_map ** 0.5  # Gamma, log wäre evtl. besser
+ax_2d_upper.imshow(
+    heatmap.T,
+    origin='lower',
+    extent=[30, 80, 20, 30],
+    aspect='auto',
+    cmap='Grays',
+    alpha=alpha_map.T
+)
 line_2d_upper, = ax_2d_upper.plot(history[HistoryRows.RH_i.value, first:], history[HistoryRows.T_i.value, first:], 
-                 color='tab:red', linewidth=1.5, label='(RH_i, T_i)')
+                 color='tab:orange', linewidth=1.5, label='(RH_i, T_i)')
 ax_2d_upper.plot(RH_from_VPD_MIN, T_range, color='green', linestyle=':', linewidth=1.0, label=f'VPD_MIN ({VPD_MIN} kPa)')
 ax_2d_upper.plot(RH_from_VPD_MAX, T_range, color='green', linestyle=':', linewidth=1.0, label=f'VPD_MAX ({VPD_MAX} kPa)')
 ax_2d_upper.set_xlim(30, 80)
@@ -234,6 +257,26 @@ ax_2d_upper.grid(True, linestyle=':', alpha=0.5)
 ax_2d_upper.legend(fontsize='small', loc='upper left')
 
 # Plot 2D unten: (RH_meas, T_meas)
+RH_meas_plot = history[HistoryRows.RH_i.value, first:]
+T_meas_plot = history[HistoryRows.T_i.value, first:]
+heatmap, xedges, yedges = np.histogram2d(
+    RH_meas_plot,
+    T_meas_plot,
+    bins=250,
+    range=[[30, 80], [20, 30]]
+)
+heatmap = gaussian_filter(heatmap, sigma=5.0)
+heatmap = heatmap / np.max(heatmap)
+alpha_map = heatmap.copy()
+alpha_map = alpha_map ** 0.5  # Gamma, log wäre evtl. besser
+ax_2d_lower.imshow(
+    heatmap.T,
+    origin='lower',
+    extent=[30, 80, 20, 30],
+    aspect='auto',
+    cmap='Grays',
+    alpha=alpha_map.T
+)
 line_2d_lower, = ax_2d_lower.plot(history[HistoryRows.RH_meas.value, first:], history[HistoryRows.T_meas.value, first:], 
                  color='tab:orange', linewidth=1.5, label='(RH_meas, T_meas)')
 ax_2d_lower.plot(RH_from_VPD_MIN, T_range, color='green', linestyle=':', linewidth=1.0, label=f'VPD_MIN ({VPD_MIN} kPa)')
