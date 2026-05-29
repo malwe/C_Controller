@@ -6,20 +6,15 @@ from enum import Enum
 from TentDynamics import GrowZeltSim
 from SensorDynamics import SensorDynamics
 from utility import RH_from_abs_hum, abs_hum_from_RH, atmospheric_vpd_from_RH, RH_from_VPD_and_temp
-from controller import Controller
+from controller import T_and_VPD_PID_Controller, PLGS_Controller, Bang_Bang_Controller
 from shared import *
 import shared
 
 
-# Es muss mindestens gelten für Euler-Integration: DT / tau_min < 0.3
-# EMA: T_sampling = 0.2 s ; alpha = 0.1 => tau_EMA = -T_sampling/ln(1 - alpha) = 1.9 s
-# => DT < 0.57
-DT = 0.25  # Zeitschritt der Simulation (s)
-
 sim = GrowZeltSim(DT)
 
 # tau_T_sensor und tau_RH_sensor frei geschätzt
-tau_T_sensor = 10.0   # (s)
+tau_T_sensor =  10.0   # (s)
 tau_RH_sensor = 10.0  # (s)
 # EMA-Filter:
 # y[i] = α x[i] + (1−α) y[i−1]
@@ -27,10 +22,13 @@ tau_RH_sensor = 10.0  # (s)
 # H(z) = Y(z)/X(z) = α / (1 - (1-α) z^-1)
 # -> Pol: z_p = (1-α)
 # Zeitdiskretes System mit Abtastzeit T_sampling: z_p = exp(-T_sampling / tau)
-T_SensorSampling = 0.2  # (s)
+T_SensorSampling = DT   # (s) MUSS identisch sein mit DT !!!
 alpha_EMA = 0.1         # (0-1)
 tau_T_EMA = tau_RH_EMA = -T_SensorSampling / np.log(1-alpha_EMA)
-sensor = SensorDynamics(DT, tau_T_sensor, tau_RH_sensor, tau_T_EMA, tau_RH_EMA)
+# Sensorrauschen (frei geschätzt -> im Datenblatt suchen oder messen)
+sigma_T  = 0.02  # (K)
+sigma_RH = 0.1   # (%)
+sensor = SensorDynamics(DT, tau_T_sensor, tau_RH_sensor, tau_T_EMA, tau_RH_EMA, sigma_T, sigma_RH)
 
 # Initialzustand des Sensors im Zelt
 sensor.init(T0=25.0, RH0=50.0)
@@ -43,7 +41,7 @@ simulation_duration = 10 * 3600.0  # s
 N = int(simulation_duration / DT)
 
 # Störgrößen (erstmal hardcoded, später Messwerte & (Kalman-)Filter)
-T_o = np.ones(N) * 24.5   # (°C)
+T_o = np.ones(N) * 24.0   # (°C)
 RH_o = np.ones(N) * 50.0  # (0-100 %)
 w_o = abs_hum_from_RH(T_o, RH_o)  # absolute Feuchte der Außenluft (kg/m^3)
 
@@ -74,17 +72,19 @@ class HistoryRows(Enum):
     VPD_atm_meas = 13
     trans = 14
     evap = 15
-    # Reglerzustände
-    I_f_T = 16
-    I_f_vpd = 17
-    I_h_vpd = 18
+    # Reglerzustände/ -debugging
+    D_f_T = 16
+    D_f_vpd = 17
+    D_h_vpd = 18
     #
     LENGTH_PLUS_ONE = 19
 
 history = np.full((HistoryRows.LENGTH_PLUS_ONE.value, N), np.nan)  # Zeilen: Historie der Größen, Spalten: Zeitschritte
 
 
-controller = Controller(DT)
+bang_bang_controller = Bang_Bang_Controller()
+plgs_controller = PLGS_Controller()
+pid_controller = T_and_VPD_PID_Controller(DT)
 
 trans = float('NaN')
 evap = float('NaN')
@@ -113,20 +113,15 @@ for k in range(N):
     # Stellgrößen (hardcoded)
     # u = [u_f[k], u_h[k]]
     # Stellgrößen (Regler)
-    # u_f, u_h = controller.bang_bang(T_meas, VPD_atm_meas)  # u[k]
-    # u_f, u_h = controller.plgs(T_meas, VPD_atm_meas)  # u[k]
-    u_f, u_h, I_f_T, I_f_vpd, I_h_vpd = controller.PI_T_and_PI_VPD(T_meas, VPD_atm_meas)  # u[k]
+    # u_f, u_h = bang_bang_controller.get_control_variables(T_meas, VPD_atm_meas)  # u[k]
+    # u_f, u_h = plgs_controller.get_control_variables(T_meas, VPD_atm_meas, False)  # u[k]
+    u_f, u_h = pid_controller.get_control_variables(T_meas, VPD_atm_meas, True)  # u[k]
     u = [u_f, u_h]
 
-    # Historie speichern
-    # Optional integrator-/interne Werte: falls nicht vorhanden, setze np.nan
-    I_f_T = globals().get('I_f_T', np.nan)
-    I_f_vpd = globals().get('I_f_vpd', np.nan)
-    I_h_vpd = globals().get('I_h_vpd', np.nan)
+    D_f_T, D_f_vpd, D_h_vpd = pid_controller.get_D_filtered()
 
     history[:, k] = [T_i, T_s_slow, T_s_fast, m_H2O_vapor, Gc, m_fog, u_f, u_h, \
-                     T_meas, RH_meas, w_i, RH_i, VPD_atm_i, VPD_atm_meas, trans, evap, \
-                     I_f_T, I_f_vpd, I_h_vpd]
+                     T_meas, RH_meas, w_i, RH_i, VPD_atm_i, VPD_atm_meas, trans, evap, D_f_T, D_f_vpd, D_h_vpd]
 
     # Simulation des nächsten Zeitschritts
     x, [trans, evap] = sim.step(x, u, z)  # x[k], u[k], z[k] -> x[k+1] 
@@ -178,6 +173,7 @@ axes_1d[1].plot(t, T_o[first:], label='T_o', color='tab:cyan', linestyle=':')
 axes_1d[1].plot(t, history[HistoryRows.T_s_slow.value, first:], label='T_s_slow', color='tab:gray')
 axes_1d[1].plot(t, history[HistoryRows.T_s_fast.value, first:], label='T_s_fast', color='tab:pink')
 axes_1d[1].plot(t, history[HistoryRows.T_meas.value, first:], label='T_meas', color='tab:red')
+axes_1d[1].plot(t, history[HistoryRows.D_f_T.value, first:], label='D_f_T', color='tab:green')
 axes_1d[1].set_ylabel('Temperature (°C)')
 axes_1d[1].legend(loc='upper right', fontsize='small')
 axes_1d[1].grid(True, linestyle=':', alpha=0.5)
@@ -196,6 +192,7 @@ axes_1d[3].plot(t, history[HistoryRows.w_i.value, first:], label='w_i (kg/m^3)',
 axes_1d[3].plot(t, history[HistoryRows.m_fog.value, first:], label='m_fog (kg)', color='tab:brown')
 axes_1d[3].plot(t, history[HistoryRows.trans.value, first:]*1000.0, label='trans (g/s)', color='tab:orange')
 axes_1d[3].plot(t, history[HistoryRows.evap.value, first:]*1000.0, label='evap (g/s)', color='tab:pink')
+
 axes_1d[3].set_ylabel('Humidity / mass')
 axes_1d[3].legend(loc='upper right', fontsize='small')
 axes_1d[3].grid(True, linestyle=':', alpha=0.5)
@@ -204,9 +201,8 @@ axes_1d[3].grid(True, linestyle=':', alpha=0.5)
 axes_1d[4].plot(t, history[HistoryRows.VPD_atm_i.value, first:], label='VPD_atm_i (kPa)', color='tab:orange', linestyle='--')
 axes_1d[4].plot(t, history[HistoryRows.VPD_atm_meas.value, first:], label='VPD_atm_meas (kPa)', color='tab:red')
 axes_1d[4].plot(t, history[HistoryRows.Gc.value, first:]*1000.0, label='Gc (g/s/kPa)', color='tab:cyan')
-axes_1d[4].plot(t, history[HistoryRows.I_f_T.value, first:]*10, label='10*I_f_T', color='gray')
-axes_1d[4].plot(t, history[HistoryRows.I_f_vpd.value, first:]*10, label='10*I_f_VPD', color='brown')
-axes_1d[4].plot(t, history[HistoryRows.I_h_vpd.value, first:]*10, label='10*I_h_VPD', color='pink')
+axes_1d[4].plot(t, history[HistoryRows.D_f_vpd.value, first:], label='D_f_vpd', color='tab:green')
+axes_1d[4].plot(t, history[HistoryRows.D_h_vpd.value, first:], label='D_h_vpd', color='tab:blue')
 axes_1d[4].set_ylabel('Other')
 axes_1d[4].legend(loc='upper right', fontsize='small')
 axes_1d[4].grid(True, linestyle=':', alpha=0.5)
@@ -221,8 +217,11 @@ for i in range(num_left_plots - 1):
 
 # Grenzkurven für VPD berechnen
 T_range = np.linspace(20, 30, 100)
-RH_from_VPD_MIN = RH_from_VPD_and_temp(VPD_MIN, T_range)
-RH_from_VPD_MAX = RH_from_VPD_and_temp(VPD_MAX, T_range)
+RH_from_VPD_1_1  = RH_from_VPD_and_temp(1.1, T_range)
+RH_from_VPD_1_2  = RH_from_VPD_and_temp(1.2, T_range)
+RH_from_VPD_1_25 = RH_from_VPD_and_temp(1.25, T_range)
+RH_from_VPD_1_3  = RH_from_VPD_and_temp(1.3, T_range)
+RH_from_VPD_1_4  = RH_from_VPD_and_temp(1.4, T_range)
 
 # Plot 2D oben: (RH_i, T_i)
 RH_i_plot = history[HistoryRows.RH_i.value, first:]
@@ -235,20 +234,23 @@ heatmap, xedges, yedges = np.histogram2d(
 )
 heatmap = gaussian_filter(heatmap, sigma=5.0)
 heatmap = heatmap / np.max(heatmap)
-alpha_map = heatmap.copy()
-alpha_map = alpha_map ** 0.5  # Gamma, log wäre evtl. besser
+# alpha_map = heatmap.copy()
+# alpha_map = alpha_map ** 0.5  # Gamma
 ax_2d_upper.imshow(
     heatmap.T,
     origin='lower',
     extent=[30, 80, 20, 30],
     aspect='auto',
     cmap='Grays',
-    alpha=alpha_map.T
+    alpha=1
 )
 line_2d_upper, = ax_2d_upper.plot(history[HistoryRows.RH_i.value, first:], history[HistoryRows.T_i.value, first:], 
                  color='tab:orange', linewidth=1.5, label='(RH_i, T_i)')
-ax_2d_upper.plot(RH_from_VPD_MIN, T_range, color='green', linestyle=':', linewidth=1.0, label=f'VPD_MIN ({VPD_MIN} kPa)')
-ax_2d_upper.plot(RH_from_VPD_MAX, T_range, color='green', linestyle=':', linewidth=1.0, label=f'VPD_MAX ({VPD_MAX} kPa)')
+ax_2d_upper.plot(RH_from_VPD_1_1,   T_range, color='green', linestyle=':', linewidth=1.0, label=f'1.1')
+ax_2d_upper.plot(RH_from_VPD_1_2, T_range, color='green', linestyle=':', linewidth=1.0, label=f'1.2')
+ax_2d_upper.plot(RH_from_VPD_1_25,   T_range, color='green', linestyle=':', linewidth=1.0, label=f'1.25')
+ax_2d_upper.plot(RH_from_VPD_1_3, T_range, color='green', linestyle=':', linewidth=1.0, label=f'1.3')
+ax_2d_upper.plot(RH_from_VPD_1_4,   T_range, color='green', linestyle=':', linewidth=1.0, label=f'1.4')
 ax_2d_upper.set_xlim(30, 80)
 ax_2d_upper.set_ylim(20, 30)
 ax_2d_upper.set_ylabel('T (°C)')
@@ -267,20 +269,23 @@ heatmap, xedges, yedges = np.histogram2d(
 )
 heatmap = gaussian_filter(heatmap, sigma=5.0)
 heatmap = heatmap / np.max(heatmap)
-alpha_map = heatmap.copy()
-alpha_map = alpha_map ** 0.5  # Gamma, log wäre evtl. besser
+# alpha_map = heatmap.copy()
+# alpha_map = alpha_map ** 0.5  # Gamma
 ax_2d_lower.imshow(
     heatmap.T,
     origin='lower',
     extent=[30, 80, 20, 30],
     aspect='auto',
     cmap='Grays',
-    alpha=alpha_map.T
+    alpha=1
 )
 line_2d_lower, = ax_2d_lower.plot(history[HistoryRows.RH_meas.value, first:], history[HistoryRows.T_meas.value, first:], 
                  color='tab:orange', linewidth=1.5, label='(RH_meas, T_meas)')
-ax_2d_lower.plot(RH_from_VPD_MIN, T_range, color='green', linestyle=':', linewidth=1.0, label=f'VPD_MIN ({VPD_MIN} kPa)')
-ax_2d_lower.plot(RH_from_VPD_MAX, T_range, color='green', linestyle=':', linewidth=1.0, label=f'VPD_MAX ({VPD_MAX} kPa)')
+ax_2d_lower.plot(RH_from_VPD_1_1,  T_range, color='green', linestyle=':', linewidth=1.0, label=f'1.1')
+ax_2d_lower.plot(RH_from_VPD_1_2,  T_range, color='green', linestyle=':', linewidth=1.0, label=f'1.2')
+ax_2d_lower.plot(RH_from_VPD_1_25, T_range, color='green', linestyle=':', linewidth=1.0, label=f'1.25')
+ax_2d_lower.plot(RH_from_VPD_1_3,  T_range, color='green', linestyle=':', linewidth=1.0, label=f'1.3')
+ax_2d_lower.plot(RH_from_VPD_1_4,  T_range, color='green', linestyle=':', linewidth=1.0, label=f'1.4')
 ax_2d_lower.set_xlim(30, 80)
 ax_2d_lower.set_ylim(20, 30)
 ax_2d_lower.set_xlabel('RH (%)')

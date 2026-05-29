@@ -1,6 +1,6 @@
 import numpy as np
 
-from utility import leaf_vpd_from_abs_hum
+from utility import atmospheric_vpd_from_abs_hum
 
 
 # Vereinfachungen
@@ -38,7 +38,7 @@ from utility import leaf_vpd_from_abs_hum
 
 
 class GrowZeltSim:
-    def __init__(self, dt=1.0):
+    def __init__(self, dt):
         self.dt = dt
 
         # Physikalische Konstanten (linearisiert)
@@ -132,7 +132,20 @@ class GrowZeltSim:
 
         self.P_hum_air_ratio = 0.5  # (0-1) Anteil der Leistung des Humidifiers welche direkt in die Luft abgegeben wird
 
-        self.T_gradient_offset = 1.0   # Abluft saugt warme Luft oben aus Zelt: T_i+T_gradient_offset (K)
+        self.T_gradient_offset = 0.5  # Abluft saugt warme Luft oben aus Zelt: T_i+T_gradient_offset (K)
+
+        # Turbulenzen (als Faktor): Ornstein-Uhlenbeck -> AR(1)
+        tau_turb = 5.0       # (s) Zeitliche korrelation aus OU
+        sigma = 0.05         # (1) Sigma des Turbulenzfaktors im stationären Zustand
+        # AR(1)
+        self.a = np.exp(-self.dt / tau_turb)
+        self.sigma_eta = sigma * np.sqrt(1 - self.a**2)
+        self.last_turb_s_fast = 0.0
+        self.last_turb_s_slow = 0.0
+        self.last_turb_wall = 0.0
+        self.last_turb_evap = 0.0
+        self.last_turb_trans = 0.0
+        self.last_turb_fog_evap = 0.0
 
     # def rough_vpd_approx(self, T, m_H2O):
     #     # sehr vereinfachtes Modell (kein exakter Psychrometrie-Ansatz)
@@ -151,25 +164,46 @@ class GrowZeltSim:
         Vdot = self.V_Lm * (u_f ** self.n)  # (m^3/s)
 
         # VPD = self.rough_vpd_approx(T_i, m_H2O)  # (kPa)
-        VPD = max(0.0, leaf_vpd_from_abs_hum(T_i, m_H2O_vapor / self.V, LED))  # (kPa)
+        VPD = max(0.0, atmospheric_vpd_from_abs_hum(T_i, m_H2O_vapor / self.V))  # (kPa)
 
         # REVIEW: ist Verdunstung der Nebeltropfen/ Aerosole so grob richtig skaliert?
-        fog_evap_factor = VPD / 1.0  # (1) VPD skaliert die Nebelverdunstung
-        fog_evap = m_fog / self.tau_fog * fog_evap_factor  # (kg/s)
+        fog_evap_vpd_factor = VPD / 1.0  # (1) VPD skaliert die Nebelverdunstung
+        # Turbulenzfaktor
+        turb_fog_evap = self.turbulence(self.last_turb_fog_evap)
+        self.last_turb_fog_evap = turb_fog_evap
+        fog_evap = m_fog / self.tau_fog * fog_evap_vpd_factor * turb_fog_evap  # (kg/s)
 
         # Transpiration (kg/s) (der Pflanzen) ist canopy conductance (bezogen auf Growfläche) * VPD
-        trans = Gc * VPD
+        # Turbulenzfaktor
+        turb_trans = self.turbulence(self.last_turb_trans)
+        self.last_turb_trans = turb_trans
+        trans = Gc * VPD * turb_trans
 
         # Verdunstung (kg/s) (von Erde und offenen Wasserflächen)
-        evap = self.k_evap * VPD
+        # Turbulenzfaktor
+        turb_evap = self.turbulence(self.last_turb_evap)
+        self.last_turb_evap = turb_evap
+        evap = self.k_evap * VPD * turb_evap
+
+        # Turbulenzfaktor für s_slow
+        turb_s_slow = self.turbulence(self.last_turb_s_slow)
+        self.last_turb_s_slow = turb_s_slow
+
+        # Turbulenzfaktor für s_fast
+        turb_s_fast = self.turbulence(self.last_turb_s_fast)
+        self.last_turb_s_fast = turb_s_fast
+
+        # Turbulenzfaktor für Zeltwand
+        turb_wall = self.turbulence(self.last_turb_wall)
+        self.last_turb_wall = turb_wall
 
         # -------------------------
         # Zustand 1: Lufttemperatur im Zelt
         # -------------------------
         Q_vent = self.rho_L * Vdot * self.c_p * (T_o - (T_i + self.T_gradient_offset))  # (W)
-        Q_wall = (T_o - T_i) / self.R_lambda
-        Q_s_slow = self.k_s_slow * (T_s_slow - T_i)
-        Q_s_fast = self.k_s_fast * (T_s_fast - T_i)
+        Q_wall = (T_o - T_i) / self.R_lambda * turb_wall
+        Q_s_slow = self.k_s_slow * (T_s_slow - T_i) * turb_s_slow
+        Q_s_fast = self.k_s_fast * (T_s_fast - T_i) * turb_s_fast
         Q_led_L = self.eta_L * LED * self.P_LED_max
         Q_fog_evap = - self.r * fog_evap
         Q_trans = - self.r * trans
@@ -181,12 +215,12 @@ class GrowZeltSim:
         # -------------------------
         # Zustand 2: Temperatur voluminöser wärmeträger Strukturen im Zelt (Wassertank, Erde)
         # -------------------------
-        dT_s_slow = ( - self.k_s_slow * (T_s_slow - T_i) + self.eta_s_slow * LED * self.P_LED_max) / self.C_s_slow
+        dT_s_slow = ( - Q_s_slow + self.eta_s_slow * LED * self.P_LED_max) / self.C_s_slow
 
         # -------------------------
         # Zustand 3: Temperatur flächiger wärmeträger Strukturen im Zelt (Zeltwände, Pflanzen, ...)
         # -------------------------
-        dT_s_fast = ( - self.k_s_fast * (T_s_fast - T_i) + self.eta_s_fast * LED * self.P_LED_max) / self.C_s_fast
+        dT_s_fast = ( - Q_s_fast + self.eta_s_fast * LED * self.P_LED_max) / self.C_s_fast
 
         # -------------------------
         # Zustand 4: Masse Wasserdampf im Zelt
@@ -233,3 +267,17 @@ class GrowZeltSim:
         m_fog = max(0.0, m_fog)
 
         return [[T_i, T_s_slow, T_s_fast, m_H2O_vapor, Gc, m_fog], [trans, evap]]  # x[k+1], abgeleitete_Groeßen[k+1]
+    
+
+    # Modell der Luftturbulenzen
+    # Anwendung: Turbulenz als Faktor multiplizieren - z.B. v = v_mean * turb
+    # Turbulenz als Ornstein-Uhlenbeck-Prozess modelliert
+    # Überführung von kontinuierlichem OU zu diskretem AR(1):
+    # OU: dturb = - 1/tau * turb * dt + sigma * dW_t
+    # AR(1): x[k+1] = a*x[k] + N(0, sigma_eta^2)
+    # sigma_eta = sigma_stationaer * sqrt(1 - a^2)
+    # => x[k+1] = exp(-dt/tau) x[k] + N(0, sigma_eta^2)
+    def turbulence(self, last_turb):
+        turb = 1 + self.a * (last_turb - 1) + np.random.normal(0, self.sigma_eta)
+        turb = np.clip(turb, 0.5, 1.5)
+        return turb

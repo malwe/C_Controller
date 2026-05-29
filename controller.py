@@ -3,61 +3,293 @@ import shared
 import numpy as np
 
 
-class Controller:
+CONTROL_DT = 1.0
+
+count = 0
+
+
+class PID_Controller:
+    def __init__(self, Kp, Ki, Kd, I_limit, I_leak, tau_D):
+
+        self.Kp = Kp
+        self.Ki = Ki
+        self.Kd = Kd
+        self.I_limit = I_limit
+        self.I_leak = I_leak
+        self.tau_D = tau_D
+
+        self.last_control_time = 0.0
+        self.last_filter_time = 0.0
+
+        self.I = 0.0
+        self.e_D = 0.0
+        self.e_D_last = 0.0
+
+
+    def get_control_variable(self, e):
+        # Leaky Integrator
+        self.I *= max(0.0, (1.0 - self.I_leak * (shared.simulation_time - self.last_control_time)))
+
+        # PID Rohsignal mit altem I für conditional integration condition
+        u_condition = self._calculate_u(e)
+
+        # Conditional Integration
+        # I-Anteil soll nur kleine statische Regelabweichung des P-Reglers ausgleichen
+        # -> keine Einstellung bei starken Regelabweichungen (= während starker Dynamik)
+        # REVIEW: Evtl. würde es sich lohnen die Schwelle runterzusetzen
+        if not (u_condition >= 1.0):
+            self.I += self.Ki * e * (shared.simulation_time - self.last_control_time)
+
+        self.I = np.clip(self.I, -self.I_limit, self.I_limit)
+
+        # PID Rohsignal mit aktuellem I
+        u = self._calculate_u(e)
+
+        self.e_D_last = self.e_D
+        self.last_control_time = shared.simulation_time
+        return u
+
+    
+    # Bei jedem neuen Messwert aufrufen
+    def update_e_D(self, e):
+        # PT1 Tiefpass (auch als EMA umsetzbar) für e_D
+        dt_filter = shared.simulation_time - self.last_filter_time
+        assert dt_filter / self.tau_D < 0.3, "PT1 e_D-Filter numerisch instabil"
+        self.e_D += (dt_filter / self.tau_D) * (e - self.e_D)
+        self.last_filter_time = shared.simulation_time
+
+
+    def _calculate_u(self, e):
+        dt_control = shared.simulation_time - self.last_control_time
+        _pi = self.Kp * e + self.I
+        if dt_control <= 0:
+            return _pi
+        else:
+            return _pi + self.Kd * (self.e_D - self.e_D_last) / (shared.simulation_time - self.last_control_time)
+    
+
+    def get_e_D(self):
+        return self.e_D
+    
+
+class T_and_VPD_PID_Controller:
     def __init__(self, dt):
-        self.dt = dt
 
         self.last_control_time = 0.0  # (s)
 
-        self.control_dt = 1.0  # (s)
+        # Möglichst bei jedem Messwert PID berechnen, da Delta_Sigma_PWM sonst zeitlich stark quantisiert wird
+        self.control_dt = 0.0  # (s) kann beliebig schnell sein, da Delta_Sigma_PWM keine feste PWM-Periode braucht
+
+        self.u_f = 0.0
+        self.u_h = 0.0
+
+        self.T_set = 25.0
+        self.vpd_set = 1.25
+
+        # EINSTELLEN
+        # Regelgrenzen -> Bestimmen Kp!
+        T_set = 25  # u_f_T = 0
+        T_max = 29  # u_f_T = U_F_ON (in Realität 100%)
+
+        vpd_min = 1.05
+        vpd_set = 1.25
+        vpd_max = 1.35
+
+        # PID gains
+        Kp_f_T = 1 / (T_max - T_set)
+        Ki_f_T = 0.0
+        Kd_f_T = 0.7 * np.sqrt(Kp_f_T)  # Faktor typisch im Bereich 0.3...1  # EINSTELLEN
+
+        Kp_f_vpd = 1 / (vpd_set - vpd_min)
+        Ki_f_vpd = 0.0
+        Kd_f_vpd = 0.7 * np.sqrt(Kp_f_vpd)  # Faktor typisch im Bereich 0.3...1  # EINSTELLEN
+
+        Kp_h_vpd = 1 / (vpd_max - vpd_set)
+        Ki_h_vpd = 0.0
+        Kd_h_vpd = 0.7 * np.sqrt(Kp_h_vpd)  # Faktor typisch im Bereich 0.3...1  # EINSTELLEN
+
+        # EINSTELLEN
+        # Anti-windup limits - I in [0, limit] erlaubt
+        I_limit_f_T   = 0.0
+        I_limit_f_vpd = 0.0
+        I_limit_h_vpd = 0.0
+
+        # EINSTELLEN
+        # Integrator leakage per second
+        # I *= (1.0 - leak * control_dt)
+        # Bedingung: 0 <= leak * control_dt < 1
+        I_leak_f_T   = 0.005
+        I_leak_f_vpd = 0.005
+        I_leak_h_vpd = 0.005
+
+        # EINSTELLEN
+        # PT1 / EMA - Tiefpassfilter für D-Anteil - zusätzlich zu allgemeinem Filter auf Messwerte
+        tau_D_f_T   = 3.0    # (s)
+        tau_D_f_vpd = 3.0
+        tau_D_h_vpd = 3.0
+
+        self.pid_f_T =   PID_Controller(Kp_f_T,   Ki_f_T,   Kd_f_T,   I_limit_f_T,   I_leak_f_T,   tau_D_f_T)
+        self.pid_f_vpd = PID_Controller(Kp_f_vpd, Ki_f_vpd, Kd_f_vpd, I_limit_f_vpd, I_leak_f_vpd, tau_D_f_vpd)
+        self.pid_h_vpd = PID_Controller(Kp_h_vpd, Ki_h_vpd, Kd_h_vpd, I_limit_h_vpd, I_leak_h_vpd, tau_D_h_vpd)
+
+        min_hold_time = 1.0  # (s) Minimale Zeit PWM an/aus
+        self.fan_delta_sigma_pwm = Delta_Sigma_PWM(min_hold_time)
+        self.humidifier_delta_sigma_pwm = Delta_Sigma_PWM(min_hold_time)
+
+    
+    def get_control_variables(self, T, VPD, f_pwm):
+        e_f_T_raw = T - self.T_set
+        e_vpd_raw = VPD - self.vpd_set
+        e_f_vpd_raw = -e_vpd_raw
+        e_h_vpd_raw = e_vpd_raw
+
+        self.pid_f_T.update_e_D(e_f_T_raw)
+        self.pid_f_vpd.update_e_D(e_f_vpd_raw)
+        self.pid_h_vpd.update_e_D(e_h_vpd_raw)
+
+        if shared.simulation_time - self.last_control_time >= self.control_dt:
+            self.last_control_time = shared.simulation_time
+
+            e_f_T = max(0.0, T - self.T_set)  # zu warm
+            e_vpd = VPD - self.vpd_set
+            e_h_vpd = max(0.0, e_vpd)         # zu trocken
+            e_f_vpd = max(0.0, -e_vpd)        # zu feucht
+
+            u_f_T_raw = self.pid_f_T.get_control_variable(e_f_T)
+            u_f_vpd_raw = self.pid_f_vpd.get_control_variable(e_f_vpd)
+            u_h_vpd_raw = self.pid_h_vpd.get_control_variable(e_h_vpd)
+
+            # Priorität bekommt der Regler mit größerem Stellwert
+            #   -> (hartes) Umschalten des dominanten Reglers -> evtl. Integrator-Mismatch
+            # REVIEW: Gewichtetes Mittel besser?
+            self.u_f = max(u_f_T_raw, u_f_vpd_raw) 
+            self.u_h = u_h_vpd_raw
+
+            self.u_f = np.clip(self.u_f, 0.0, 1.0)
+            self.u_h = np.clip(self.u_h, 0.0, 1.0)
+
+            # nur für Simulation (Potentiometereinstellung an Abluft und Humidifier)
+            self.u_f *= U_F_ON
+            self.u_h *= U_H_ON
+
+        assert(self.u_f >= 0 and self.u_f <= 1 and self.u_h >= 0 and self.u_h <= 1)
+
+        if f_pwm:
+            fan_pwm_state = self.fan_delta_sigma_pwm.step(self.u_f / U_F_ON)  # PWM: continuierlich[0, 1] -> diskret{0, 1}
+            humidifier_pwm_state = self.humidifier_delta_sigma_pwm.step(self.u_h / U_H_ON)
+
+            self.u_f = fan_pwm_state * U_F_ON
+            self.u_h = humidifier_pwm_state * U_H_ON
+
+        return self.u_f, self.u_h
+    
+
+    # Zum Plotten in main.py
+    def get_D_filtered(self):
+        D_f_T = self.T_set + self.pid_f_T.get_e_D()
+        D_f_vpd = self.vpd_set - self.pid_f_vpd.get_e_D()
+        D_h_vpd = self.vpd_set + self.pid_h_vpd.get_e_D()
+        return D_f_T, D_f_vpd, D_h_vpd
+
+
+class PLGS_Controller:
+    def __init__(self):
+
+        self.last_control_time = 0.0  # (s)
+
+        self.control_dt = CONTROL_DT  # (s)
+
+        self.u_f = 0.0
+        self.u_h = 0.0
+
+        # PWM on time
+        # PWM period = self.control_dt
+        self.on_time_fan = 0.0
+        self.on_time_hum = 0.0
+
+        # Piecewise-linear gain scheduling / continuous heuristic nonlinear controller / piecewise linear fuzzy-like controller
+        # self.plgs_vpd_transition_width = (VPD_MAX - VPD_MIN) / 2  # Keine Totzone -> quasi P-Regler
+        # self.plgs_vpd_min    = VPD_MIN  # - self.plgs_vpd_transition_width / 2
+        # self.plgs_vpd_good_1 = self.plgs_vpd_min + self.plgs_vpd_transition_width
+        # self.plgs_vpd_max    = VPD_MAX  # + self.plgs_vpd_transition_width / 2
+        # self.plgs_vpd_good_2 = self.plgs_vpd_max - self.plgs_vpd_transition_width
+        self.plgs_vpd_min = 1.1
+        self.plgs_vpd_good_1 = 1.25
+        self.plgs_vpd_good_2 = 1.25
+        self.plgs_vpd_max = 1.4
+        #
+        # self.plgs_T_transition_width = T_MAX - T_GOOD
+        # self.plgs_T_max = T_MAX
+        # self.plgs_T_good_2 = self.plgs_T_max - self.plgs_T_transition_width
+        self.plgs_T_good_2 = 25.0
+        self.plgs_T_max = 28
+
+
+        # piecewise-linear gain scheduling - heuristisch - Ähnlichkeiten mit P-Regler
+    def get_control_variables(self, T, VPD, f_pwm):
+
+        if shared.simulation_time - self.last_control_time >= self.control_dt:
+            self.last_control_time = shared.simulation_time
+
+            u_h_VPD = 0.0
+            u_f_VPD = 0.0
+            u_f_T = 0.0
+
+            if VPD < self.plgs_vpd_min:            # too humid
+                u_h_VPD = 0.0
+                u_f_VPD = U_F_ON
+            elif VPD < self.plgs_vpd_good_1:       # humid but ok
+                u_h_VPD = 0.0
+                u_f_VPD = U_F_ON * (1 - (VPD - self.plgs_vpd_min) / (self.plgs_vpd_good_1 - self.plgs_vpd_min))
+            elif VPD < self.plgs_vpd_good_2:       # humidity perfect
+                u_h_VPD = 0.0
+                u_f_VPD = 0.0
+            elif VPD < self.plgs_vpd_max:          # dry but ok
+                u_h_VPD = U_H_ON * (VPD - self.plgs_vpd_good_2) / (self.plgs_vpd_max - self.plgs_vpd_good_2)
+                u_f_VPD = 0.0
+            else:
+                u_h_VPD = U_H_ON
+                u_f_VPD = 0.0
+
+            if (T > self.plgs_T_good_2) and (T < self.plgs_T_max):  # hot but ok
+                u_f_T = U_F_ON * (T - self.plgs_T_good_2) / (self.plgs_T_max - self.plgs_T_good_2)
+            elif T >= self.plgs_T_max:              # too hot
+                u_f_T = U_F_ON
+
+            self.u_h = u_h_VPD
+            self.u_f = max(u_f_VPD, u_f_T)  # Priorität bekommt der Regler mit größerem Stellwert
+
+            # PWM
+            self.on_time_fan = self.u_f / U_F_ON * self.control_dt
+            self.on_time_hum = self.u_h / U_H_ON * self.control_dt
+
+            if self.on_time_fan < 1.0: self.on_time_fan = 0.0
+            if self.control_dt - self.on_time_fan < 1.0: self.on_time_fan = self.control_dt
+
+            if self.on_time_hum < 1.0: self.on_time_hum = 0.0
+            if self.control_dt - self.on_time_hum < 1.0: self.on_time_hum = self.control_dt
+
+        u_f_pwm = U_F_ON if shared.simulation_time - self.last_control_time < self.on_time_fan else 0.0
+        u_h_pwm = U_H_ON if shared.simulation_time - self.last_control_time < self.on_time_hum else 0.0
+
+        # assert(self.u_f >= 0 and self.u_f <= 1 and self.u_h >= 0 and self.u_h <= 1)
+        if f_pwm:
+            return u_f_pwm, u_h_pwm
+        else:
+            return self.u_f, self.u_h
+
+
+class Bang_Bang_Controller:
+    def __init__(self, ):
+        self.last_control_time = 0.0  # (s)
+
+        self.control_dt = CONTROL_DT  # (s)
 
         self.u_f = 0.0
         self.u_h = 0.0
 
 
-        # Piecewise-linear gain scheduling / continuous heuristic nonlinear controller / piecewise linear fuzzy-like controller
-        self.plgs_vpd_transition_width = (VPD_MAX - VPD_MIN) / 2  # Keine Totzone -> quasi P-Regler
-        self.plgs_vpd_min    = VPD_MIN  # - self.plgs_vpd_transition_width / 2
-        self.plgs_vpd_good_1 = self.plgs_vpd_min + self.plgs_vpd_transition_width
-        self.plgs_vpd_max    = VPD_MAX  # + self.plgs_vpd_transition_width / 2
-        self.plgs_vpd_good_2 = self.plgs_vpd_max - self.plgs_vpd_transition_width
-        #
-        self.plgs_T_transition_width = T_MAX - T_GOOD
-        self.plgs_T_max = T_MAX
-        self.plgs_T_good_2 = self.plgs_T_max - self.plgs_T_transition_width
-
-
-        # PI_T_and_PI_VPD
-        self.T_set = (T_MAX + T_GOOD) / 2  # REVIEW: über diese Definition lässt sich streiten
-        self.vpd_set = (VPD_MIN + VPD_MAX) / 2
-
-        # PI gains
-        self.Kp_f_T = 0.4
-        self.Ki_f_T = 0.004
-
-        self.Kp_f_vpd = 1.0
-        self.Ki_f_vpd = 0.01
-
-        self.Kp_h_vpd = 10.0
-        self.Ki_h_vpd = 0.1
-
-        # Integrator states
-        self.I_f_T = 0.0
-        self.I_f_vpd = 0.0
-        self.I_h_vpd = 0.0
-
-        # Anti-windup limits - derzeit nur I element [0, limit] erlaubt
-        self.I_limit_f_T = 0.5
-        self.I_limit_f_vpd = 0.5
-        self.I_limit_h_vpd = 0.5
-
-        # Integrator leakage per second
-        # Bedingung: 0 <= leak * control_dt < 1
-        self.leak_f_T = 0.005
-        self.leak_f_vpd = 0.005
-        self.leak_h_vpd = 0.005
-
-    def bang_bang(self, T, VPD):
+    def get_control_variables(self, T, VPD):
 
         if shared.simulation_time - self.last_control_time >= self.control_dt:
             self.last_control_time = shared.simulation_time
@@ -81,131 +313,30 @@ class Controller:
         return self.u_f, self.u_h
     
 
-    # piecewise-linear gain scheduling - heuristisch - Ähnlichkeiten mit P-Regler
-    def plgs(self, T, VPD):
+# first-order delta-sigma modulator with dwell-time-limited switching and anti-windup
+class Delta_Sigma_PWM:
+    def __init__(self, min_hold):
+        self.min_hold = min_hold  # (s)
+        self.integrator = 0.0
+        self.last_switch_time = -1e9
+        self.last_integration_time = None
+        self.state = 0.0
 
-        if shared.simulation_time - self.last_control_time >= self.control_dt:
-            self.last_control_time = shared.simulation_time
+    def step(self, u_continuous):
+        assert u_continuous >= 0.0 and u_continuous <= 1.0
 
-            u_h_VPD = 0.0
-            u_f_VPD = 0.0
-            u_f_T = 0.0
+        if self.last_integration_time == None:
+            self.last_integration_time = shared.simulation_time
+        
+        self.integrator += (u_continuous - self.state) * (shared.simulation_time - self.last_integration_time)
+        self.integrator = np.clip(self.integrator, -30, 30)  # Anti-Windup
+        self.last_integration_time = shared.simulation_time
 
-            if VPD < self.plgs_vpd_min:            # too humid
-                u_h_VPD = 0.0
-                u_f_VPD = U_F_ON
-            elif VPD < self.plgs_vpd_good_1:       # humid but ok
-                u_h_VPD = 0.0
-                u_f_VPD = U_F_ON * (1 - (VPD - self.plgs_vpd_min) / self.plgs_vpd_transition_width)
-            elif VPD < self.plgs_vpd_good_2:       # humidity perfect
-                u_h_VPD = 0.0
-                u_f_VPD = 0.0
-            elif VPD < self.plgs_vpd_max:          # dry but ok
-                u_h_VPD = U_H_ON * (VPD - self.plgs_vpd_good_2) / self.plgs_vpd_transition_width
-                u_f_VPD = 0.0
-            else:
-                u_h_VPD = U_H_ON
-                u_f_VPD = 0.0
+        if (shared.simulation_time -  self.last_switch_time) >= self.min_hold:
+            new_state = 0.0 if self.integrator < 0.0 else 1.0
 
-            if (T > self.plgs_T_good_2) and (T < self.plgs_T_max):  # hot but ok
-                u_f_T = U_F_ON * (T - self.plgs_T_good_2) / self.plgs_T_transition_width
-            elif T >= self.plgs_T_max:              # too hot
-                u_f_T = U_F_ON
-
-            self.u_h = u_h_VPD
-            self.u_f = max(u_f_VPD, u_f_T)  # Priorität bekommt der Regler mit größerem Stellwert
-
-        assert(self.u_f >= 0 and self.u_f <= 1 and self.u_h >= 0 and self.u_h <= 1)
-        return self.u_f, self.u_h
-    
-
-    def PI_T_and_PI_VPD(self, T, VPD):
-
-        # Einseitige Regler -> Leaky Integratoren / Integrator Decay notwendig
-        # Conditional Integration (Integrationssperre bei Sättigung) für besseres Anti-Windup
-
-        if shared.simulation_time - self.last_control_time >= self.control_dt:
-            self.last_control_time = shared.simulation_time
-
-            # -------------------------------------------------
-            # Temperatur zu hoch -> Lüfter
-
-            e_T = max(0.0, T - self.T_set)
-
-            # Implizites Deadband bei T < self.T_set
-
-            # Leaky Integrator
-            self.I_f_T *= (1.0 - self.leak_f_T * self.control_dt)
-
-            # PI Rohsignal mit altem I für conditional integration condition
-            u_f_T_condition = self.Kp_f_T * e_T + self.I_f_T
-
-            # Conditional Integration
-            # I-Anteil soll nur kleine statisch Regelabweichung des P-Reglers ausgleichen
-            # -> keine Einstellung bei starken Regelabweichungen (= während starker Dynamik)
-            # REVIEW: Evtl. würde es sich lohnen die Schwelle runterzusetzen
-            if not (u_f_T_condition >= 1.0):
-                self.I_f_T += self.Ki_f_T * e_T * self.control_dt
-
-            # REVIEW: I evtl. auch mit [-limit, limit] sinnvoll
-            self.I_f_T = np.clip(self.I_f_T, 0.0, self.I_limit_f_T)
-
-            # PI Rohsignal mit aktuellem I
-            u_f_T_raw = self.Kp_f_T * e_T + self.I_f_T
-
-            # -------------------------------------------------
-            # VPD zu hoch/ trocken -> Humidifier
-
-            e_vpd = VPD - self.vpd_set
-
-            # REVIEW: Deadband sinnvoll?
-            # if abs(e_vpd) < 0.03:
-            #     e_vpd = 0.0
-
-            e_dry = max(0.0, e_vpd)
-
-            self.I_h_vpd *= (1.0 - self.leak_h_vpd * self.control_dt)
-
-            u_h_vpd_condition = self.Kp_h_vpd * e_dry + self.I_h_vpd
-
-            if not (u_h_vpd_condition >= 1.0):
-                self.I_h_vpd += self.Ki_h_vpd * e_dry * self.control_dt
-
-            self.I_h_vpd = np.clip(self.I_h_vpd, 0.0, self.I_limit_h_vpd)
-
-            u_h_vpd_raw = self.Kp_h_vpd * e_dry + self.I_h_vpd
-
-            # -------------------------------------------------
-            # VPD zu niedrig/ feucht -> Lüfter
-
-            e_humid = max(0.0, -e_vpd)
-
-            self.I_f_vpd *= (1.0 - self.leak_f_vpd * self.control_dt)
-
-            u_f_vpd_condition = self.Kp_f_vpd * e_humid + self.I_f_vpd
-
-            if not (u_f_vpd_condition >= 1.0):
-                self.I_f_vpd += self.Ki_f_vpd * e_humid * self.control_dt
-
-            self.I_f_vpd = np.clip(self.I_f_vpd, 0.0, self.I_limit_f_vpd)
-
-            u_f_vpd_raw = self.Kp_f_vpd * e_humid + self.I_f_vpd
-
-            # -------------------------------------------------
-            # Stellgrößen kombinieren
-
-            # Priorität bekommt der Regler mit größerem Stellwert
-            #   -> (hartes) Umschalten des dominanten Reglers -> evtl. Integrator-Mismatch
-            # REVIEW: Gewichtetes Mittel besser?
-            self.u_f = max(u_f_T_raw, u_f_vpd_raw) 
-            self.u_h = u_h_vpd_raw
-
-            self.u_f = np.clip(self.u_f, 0.0, 1.0)
-            self.u_h = np.clip(self.u_h, 0.0, 1.0)
-
-        assert(self.u_f >= 0 and self.u_f <= 1 and self.u_h >= 0 and self.u_h <= 1)
-        return self.u_f, self.u_h, self.I_f_T, self.I_f_vpd, self.I_h_vpd
-
-
-    def PI_T_and_PI_w(self, T, VPD):
-        return 0, 0
+            if new_state != self.state:
+                self.state = new_state
+                self.last_switch_time = shared.simulation_time
+        
+        return self.state

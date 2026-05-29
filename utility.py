@@ -64,6 +64,14 @@ def atmospheric_vpd_from_RH(T, RH):
     return VPD_atm
 
 
+# Atmosphärischer VPD (kPa)
+def atmospheric_vpd_from_abs_hum(T, w):
+    RH = RH_from_abs_hum(T, w)
+    SVP_air = _saturation_vapor_pressure(T)
+    VPD_atm = (1 - RH/100.0) * SVP_air
+    return VPD_atm
+
+
 # RH (1-100 %) from VPD (kPa) and temperature (°C)
 def RH_from_VPD_and_temp(VPD, T):
     SVP = _saturation_vapor_pressure(T)
