@@ -26,8 +26,8 @@ T_SensorSampling = DT   # (s) MUSS identisch sein mit DT !!!
 alpha_EMA = 0.1         # (0-1)
 tau_T_EMA = tau_RH_EMA = -T_SensorSampling / np.log(1-alpha_EMA)
 # Sensorrauschen (frei geschätzt -> im Datenblatt suchen oder messen)
-sigma_T  = 0.02  # (K)
-sigma_RH = 0.1   # (%)
+sigma_T  = 0.04 / 3  # (K) SHT31 lt. Datenblatt (High Acc. Mode) Repeatability = 3 sigma = 0.04
+sigma_RH = 0.08 / 3   # (%) SHT31 lt. Datenblatt (High Acc. Mode) Repeatability = 3 sigma = 0.08
 sensor = SensorDynamics(DT, tau_T_sensor, tau_RH_sensor, tau_T_EMA, tau_RH_EMA, sigma_T, sigma_RH)
 
 # Initialzustand des Sensors im Zelt
@@ -96,7 +96,7 @@ for k in range(N):
     shared.simulation_time = k * DT
 
     # Störgrößen (erstmal hardcoded, später Messwerte)
-    z = [T_o[k], w_o[k], LED[k]]  # z[k]
+    d = [T_o[k], w_o[k], LED[k]]  # d[k]
 
     T_i, T_s_slow, T_s_fast, m_H2O_vapor, Gc, m_fog = x
 
@@ -124,7 +124,7 @@ for k in range(N):
                      T_meas, RH_meas, w_i, RH_i, VPD_atm_i, VPD_atm_meas, trans, evap, D_f_T, D_f_vpd, D_h_vpd]
 
     # Simulation des nächsten Zeitschritts
-    x, [trans, evap] = sim.step(x, u, z)  # x[k], u[k], z[k] -> x[k+1] 
+    x, [trans, evap] = sim.step(x, u, d)  # x[k], u[k], z[k] -> x[k+1] 
 
 
 # -------------------------

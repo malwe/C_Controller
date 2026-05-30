@@ -132,9 +132,16 @@ class T_and_VPD_PID_Controller:
         self.pid_f_vpd = PID_Controller(Kp_f_vpd, Ki_f_vpd, Kd_f_vpd, I_limit_f_vpd, I_leak_f_vpd, tau_D_f_vpd)
         self.pid_h_vpd = PID_Controller(Kp_h_vpd, Ki_h_vpd, Kd_h_vpd, I_limit_h_vpd, I_leak_h_vpd, tau_D_h_vpd)
 
-        min_hold_time = 1.0  # (s) Minimale Zeit PWM an/aus
-        self.fan_delta_sigma_pwm = Delta_Sigma_PWM(min_hold_time)
-        self.humidifier_delta_sigma_pwm = Delta_Sigma_PWM(min_hold_time)
+        # min_pwm_hold_time_fan = 7.0  # (s) Minimale Zeit PWM an/aus
+        # min_pwm_hold_time_humidifier = 3.0
+        # self.fan_quantizer = Delta_Sigma_PWM(min_pwm_hold_time_fan)
+        # self.humidifier_quantizer = Delta_Sigma_PWM(min_pwm_hold_time_humidifier)
+
+        min_quant_hold_time_fan = 1.0  # (s) Minimale Haltezeit des quantisierten Wertes
+        min_quant_hold_time_humidifier = 1.0
+        num_bits_quantizer = 3
+        self.fan_quantizer = Delta_Sigma_Quantizer(min_quant_hold_time_fan, num_bits_quantizer)
+        self.humidifier_quantizer = Delta_Sigma_Quantizer(min_quant_hold_time_humidifier, num_bits_quantizer)
 
     
     def get_control_variables(self, T, VPD, f_pwm):
@@ -175,8 +182,8 @@ class T_and_VPD_PID_Controller:
         assert(self.u_f >= 0 and self.u_f <= 1 and self.u_h >= 0 and self.u_h <= 1)
 
         if f_pwm:
-            fan_pwm_state = self.fan_delta_sigma_pwm.step(self.u_f / U_F_ON)  # PWM: continuierlich[0, 1] -> diskret{0, 1}
-            humidifier_pwm_state = self.humidifier_delta_sigma_pwm.step(self.u_h / U_H_ON)
+            fan_pwm_state = self.fan_quantizer.step(self.u_f / U_F_ON)  # PWM: kontinuierlich[0, 1] -> diskret{0, 1}
+            humidifier_pwm_state = self.humidifier_quantizer.step(self.u_h / U_H_ON)
 
             self.u_f = fan_pwm_state * U_F_ON
             self.u_h = humidifier_pwm_state * U_H_ON
@@ -313,10 +320,11 @@ class Bang_Bang_Controller:
         return self.u_f, self.u_h
     
 
-# first-order delta-sigma modulator with dwell-time-limited switching and anti-windup
+# first-order 1-bit delta-sigma modulator with dwell-time-limited switching and anti-windup
+# Nicht ganz/ abgewandelter Spezialfall von Delta_Sigma_Quantizer siehe unten
 class Delta_Sigma_PWM:
-    def __init__(self, min_hold):
-        self.min_hold = min_hold  # (s)
+    def __init__(self, min_hold_time):
+        self.min_hold_time = min_hold_time  # (s)
         self.integrator = 0.0
         self.last_switch_time = -1e9
         self.last_integration_time = None
@@ -329,10 +337,10 @@ class Delta_Sigma_PWM:
             self.last_integration_time = shared.simulation_time
         
         self.integrator += (u_continuous - self.state) * (shared.simulation_time - self.last_integration_time)
-        self.integrator = np.clip(self.integrator, -30, 30)  # Anti-Windup
+        self.integrator = np.clip(self.integrator, -5, 5)  # Anti-Windup
         self.last_integration_time = shared.simulation_time
 
-        if (shared.simulation_time -  self.last_switch_time) >= self.min_hold:
+        if (shared.simulation_time - self.last_switch_time) >= self.min_hold_time:
             new_state = 0.0 if self.integrator < 0.0 else 1.0
 
             if new_state != self.state:
@@ -340,3 +348,48 @@ class Delta_Sigma_PWM:
                 self.last_switch_time = shared.simulation_time
         
         return self.state
+
+
+# first-order N-bit delta-sigma modulator with dwell-time-limited switching
+# rate-limited multi-level tracking quantizer
+class Delta_Sigma_Quantizer:
+    def __init__(self, min_hold_time, num_bits):
+        assert num_bits >= 1
+
+        self.num_bits = num_bits
+        self.num_levels = 2**num_bits
+        self.levels = np.linspace(0.0, 1.0, self.num_levels)
+        self.min_hold_time = min_hold_time
+
+        self.integrator = 0.0  # Fehlerzustand
+        self.output = 0.0
+        self.last_integration_time = None
+        self.last_switch_time = -1e9
+
+    def step(self, u_continuous):
+        assert u_continuous >= 0.0 and u_continuous <= 1.0
+
+        now = shared.simulation_time
+
+        if self.last_integration_time is None:
+            self.last_integration_time = now
+
+        self.integrator += (u_continuous - self.output) * (now - self.last_integration_time)
+        self.integrator = np.clip(self.integrator, -5, 5)  # Anti-Windup
+        self.last_integration_time = now
+
+        if (now - self.last_switch_time) >= self.min_hold_time:
+            # keine Ahnung was korrekt ist - beides verhält sich ähnlich
+            # Variante 1
+            v = u_continuous + self.integrator
+            # Variante 2
+            # v = self.output + self.integrator
+
+            idx = np.argmin(np.abs(self.levels - v))
+            new_output = self.levels[idx]
+
+            if new_output != self.output:
+                self.output = new_output
+                self.last_switch_time = shared.simulation_time
+
+        return self.output

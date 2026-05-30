@@ -153,10 +153,10 @@ class GrowZeltSim:
     #     return max(0.0, (1 - RH) * np.exp(0.05 * T))
 
     # Dynamik
-    def step(self, x, u, z):
+    def step(self, x, u, d):
         T_i, T_s_slow, T_s_fast, m_H2O_vapor, Gc, m_fog = x  # (K) (K) (K) (kg) (kg/s/kPa) (kg)
         u_f, u_h = u                             # (0-1) (0-1)
-        T_o, w_o, LED = z                        # (K) (kg/m^3) (0-1)
+        T_o, w_o, LED = d                        # (K) (kg/m^3) (0-1)
 
         # -------------------------
         # Hilfsgrößen

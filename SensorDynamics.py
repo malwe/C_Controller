@@ -2,8 +2,9 @@ import numpy as np
 
 
 # Sensor <-> Umgebung physikalisch PT1
-# In Reihe dazu: EMA-Filter = PT1 (in etwa)
+# In Reihe dazu: EMA-Filter = PT1
 # => PT2 gesamt
+# G(s) = 1 / (1 + tau_sensor) * 1 / (1 + tau_EMA)
 
 
 class SensorDynamics:
