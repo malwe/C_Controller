@@ -1,6 +1,6 @@
 import numpy as np
 
-from utility import atmospheric_vpd_from_abs_hum
+from utility import atmospheric_vpd_from_abs_hum, RH_from_abs_hum
 
 
 # Vereinfachungen
@@ -49,7 +49,7 @@ class GrowZeltSim:
         # Konstante Modellparameter
         self.V = 1.15             # Zeltvolumen (m^3)
         self.H = 0.000061         # Humidifier (kg/s) max (220 g/h)
-        self.V_Lm = 0.08          # max Luftstrom (m^3/s) (nur Rohrventilator angeblich 0,096)
+        self.Vdot_max = 0.05      # max Luftstrom (m^3/s) (nur Rohrventilator angeblich 0,096)
         self.P_LED_max = 220.0    # max LED-Leistung (W)
         self.P_hum_max = 25.0     # max el. Leistung des Humidifiers (W)
 
@@ -93,7 +93,7 @@ class GrowZeltSim:
         self.eta_s_slow = 0.05    # LED-Leistungs Anteil Wassertank, Erde
         assert(abs(self.eta_L + self.eta_s_fast + self.eta_s_slow - 1) < 1e-9)
   
-        self.V_Lm = 0.05          # max Luftstrom (m^3/s) (nur Rohrventilator angeblich 0,096)
+        self.Vdot_max = 0.05          # max Luftstrom (m^3/s) (nur Rohrventilator angeblich 0,096)
         self.n = 1.0              # Exponent Rohrventilator Kennlinie (vermutlich 1...3)
 
         # Altes Modell Transpiration
@@ -135,17 +135,26 @@ class GrowZeltSim:
         self.T_gradient_offset = 0.5  # Abluft saugt warme Luft oben aus Zelt: T_i+T_gradient_offset (K)
 
         # Turbulenzen (als Faktor): Ornstein-Uhlenbeck -> AR(1)
-        tau_turb = 5.0       # (s) Zeitliche korrelation aus OU
+        tau_turb = 5.0       # (s) Zeitliche Korrelation aus OU
         sigma = 0.05         # (1) Sigma des Turbulenzfaktors im stationären Zustand
         # AR(1)
         self.a = np.exp(-self.dt / tau_turb)
         self.sigma_eta = sigma * np.sqrt(1 - self.a**2)
-        self.last_turb_s_fast = 0.0
+        self.last_turb_s_fast = 0.0  # Simulationszustände, keine Zustände im EKF
         self.last_turb_s_slow = 0.0
         self.last_turb_wall = 0.0
         self.last_turb_evap = 0.0
         self.last_turb_trans = 0.0
         self.last_turb_fog_evap = 0.0
+        self.last_turb_sensor = 0.0
+
+        # Luft->Sensor PT1 (ohne Rauschen und EMA)
+        self.tau_T_sensor = 10.0    # (s)
+        self.tau_RH_sensor = 10.0
+
+        # Dynamik Abluft - Grobe Vereinfachung: PT1
+        self.tau_exhaust = 2.0  # (s) frei geschätzt
+
 
     # def rough_vpd_approx(self, T, m_H2O):
     #     # sehr vereinfachtes Modell (kein exakter Psychrometrie-Ansatz)
@@ -153,49 +162,55 @@ class GrowZeltSim:
     #     return max(0.0, (1 - RH) * np.exp(0.05 * T))
 
     # Dynamik
-    def step(self, x, u, d):
-        T_i, T_s_slow, T_s_fast, m_H2O_vapor, Gc, m_fog = x  # (K) (K) (K) (kg) (kg/s/kPa) (kg)
-        u_f, u_h = u                             # (0-1) (0-1)
-        T_o, w_o, LED = d                        # (K) (kg/m^3) (0-1)
+    def step(self, x, u, d, f_EKF):
+        T_i, T_s_slow, T_s_fast, T_sensor, RH_sensor, m_H2O_vapor, Gc, m_fog, Vdot = x  # (K) (K) (K) (K) (%) (kg) (kg/s/kPa) (kg) (m^3/s)
+        u_f, u_h = u           # (0-1) (0-1)
+        T_o, w_o, LED = d      # (K) (kg/m^3) (0-1)
 
         # -------------------------
         # Hilfsgrößen
         # -------------------------
-        Vdot = self.V_Lm * (u_f ** self.n)  # (m^3/s)
 
         # VPD = self.rough_vpd_approx(T_i, m_H2O)  # (kPa)
         VPD = max(0.0, atmospheric_vpd_from_abs_hum(T_i, m_H2O_vapor / self.V))  # (kPa)
 
-        # REVIEW: ist Verdunstung der Nebeltropfen/ Aerosole so grob richtig skaliert?
-        fog_evap_vpd_factor = VPD / 1.0  # (1) VPD skaliert die Nebelverdunstung
-        # Turbulenzfaktor
-        turb_fog_evap = self.turbulence(self.last_turb_fog_evap)
-        self.last_turb_fog_evap = turb_fog_evap
-        fog_evap = m_fog / self.tau_fog * fog_evap_vpd_factor * turb_fog_evap  # (kg/s)
+        if f_EKF:
+            turb_fog_evap = turb_trans = turb_evap = turb_s_slow = turb_s_fast = turb_wall = turb_sensor = 0
+        else:
+            turb_fog_evap = self.turbulence(self.last_turb_fog_evap)
+            self.last_turb_fog_evap = turb_fog_evap
+
+            turb_trans = self.turbulence(self.last_turb_trans)
+            self.last_turb_trans = turb_trans
+
+            turb_evap = self.turbulence(self.last_turb_evap)
+            self.last_turb_evap = turb_evap
+
+            turb_s_slow = self.turbulence(self.last_turb_s_slow)
+            self.last_turb_s_slow = turb_s_slow
+
+            turb_s_fast = self.turbulence(self.last_turb_s_fast)
+            self.last_turb_s_fast = turb_s_fast
+
+            turb_wall = self.turbulence(self.last_turb_wall)
+            self.last_turb_wall = turb_wall
+
+            # REVIEW: Sensor wird von punktuellen Turbulenzen beeinflusst -> stärkerer Einfluss als bei anderen Größen zu erwarten (hier nicht umgesetzt)
+            turb_sensor = self.turbulence(self.last_turb_sensor)
+            self.last_turb_sensor = turb_sensor
 
         # Transpiration (kg/s) (der Pflanzen) ist canopy conductance (bezogen auf Growfläche) * VPD
-        # Turbulenzfaktor
-        turb_trans = self.turbulence(self.last_turb_trans)
-        self.last_turb_trans = turb_trans
         trans = Gc * VPD * turb_trans
 
         # Verdunstung (kg/s) (von Erde und offenen Wasserflächen)
-        # Turbulenzfaktor
-        turb_evap = self.turbulence(self.last_turb_evap)
-        self.last_turb_evap = turb_evap
         evap = self.k_evap * VPD * turb_evap
 
-        # Turbulenzfaktor für s_slow
-        turb_s_slow = self.turbulence(self.last_turb_s_slow)
-        self.last_turb_s_slow = turb_s_slow
+        # REVIEW: ist Verdunstung der Nebeltropfen/ Aerosole so grob richtig skaliert?
+        fog_evap_vpd_factor = VPD / 1.0  # (1) VPD skaliert die Nebelverdunstung
+        fog_evap = m_fog / self.tau_fog * fog_evap_vpd_factor * turb_fog_evap  # (kg/s)
 
-        # Turbulenzfaktor für s_fast
-        turb_s_fast = self.turbulence(self.last_turb_s_fast)
-        self.last_turb_s_fast = turb_s_fast
-
-        # Turbulenzfaktor für Zeltwand
-        turb_wall = self.turbulence(self.last_turb_wall)
-        self.last_turb_wall = turb_wall
+        w_i = m_H2O_vapor / self.V  # absolute Feuchte (kg/m^3)
+        RH_i = RH_from_abs_hum(T_i, w_i)
 
         # -------------------------
         # Zustand 1: Lufttemperatur im Zelt
@@ -223,13 +238,22 @@ class GrowZeltSim:
         dT_s_fast = ( - Q_s_fast + self.eta_s_fast * LED * self.P_LED_max) / self.C_s_fast
 
         # -------------------------
-        # Zustand 4: Masse Wasserdampf im Zelt
+        # Zustand 4: Temperatur des Sensors
         # -------------------------
-        w_i = m_H2O_vapor / self.V  # absolute Feuchte (kg/m^3)
+        dT_sensor = 1/self.tau_T_sensor * (T_i - T_sensor) * turb_sensor
+
+        # -------------------------
+        # Zustand 5: Temperatur des Sensors
+        # -------------------------
+        dRH_sensor = 1/self.tau_RH_sensor * (RH_i - RH_sensor)
+
+        # -------------------------
+        # Zustand 6: Masse Wasserdampf im Zelt
+        # -------------------------
         dm_H2O_vapor = Vdot * (w_o - w_i) + m_fog / self.tau_fog + trans + evap  # (kg/s)
 
         # -------------------------
-        # Zustand 5: Transpiration dynamisch
+        # Zustand 7: Transpiration dynamisch
         # -------------------------
         # https://bg.copernicus.org/articles/21/1501/2024/
         # https://www.implexx.io/manuals-and-guides/how-to-measure-canopy-stomatal-conductance/
@@ -245,28 +269,37 @@ class GrowZeltSim:
         # dtrans = 1/self.tau_trans * (self.k_trans * VPD - trans)  # (kg/s/s)
 
         # -------------------------
-        # Zustand 6: Nebel in Luft (noch als Tropfen, nicht als Dampf) - Annahme: PT1
+        # Zustand 8: Nebel in Luft (noch als Tropfen, nicht als Dampf) - Annahme: PT1
         # -------------------------
         # -Vdot*m_fog/self.V -> Nebel wird durch Abluft entfernt
         # Praktisch ist die Abluft aber weit vom Nebel entfernt -> evtl. wieder entfernen?
         dm_fog = self.H * u_h - fog_evap - Vdot * m_fog / self.V  # (kg/s)
 
         # -------------------------
+        # Zustand 9: Abluft Volumenstrom (m^3/s) - PT1
+        # -------------------------
+        Vdot_ss = self.Vdot_max * (u_f ** self.n)
+        dVdot = 1/self.tau_exhaust * (Vdot_ss - Vdot)
+
+        # -------------------------
         # Euler Vorwärts-Integration
         # -------------------------
         T_i += self.dt * dT_i
         T_s_slow += self.dt * dT_s_slow
-        T_s_fast += self.dt * dT_s_fast 
+        T_s_fast += self.dt * dT_s_fast
+        T_sensor += self.dt * dT_sensor
+        RH_sensor += self.dt * dRH_sensor
         m_H2O_vapor += self.dt * dm_H2O_vapor
         Gc += self.dt * dGc
         # trans += self.dt * dtrans
         m_fog += self.dt * dm_fog
+        Vdot += self.dt * dVdot
 
         m_H2O_vapor = max(0.0, m_H2O_vapor)
         trans = max(0.0, trans)
         m_fog = max(0.0, m_fog)
 
-        return [[T_i, T_s_slow, T_s_fast, m_H2O_vapor, Gc, m_fog], [trans, evap]]  # x[k+1], abgeleitete_Groeßen[k+1]
+        return [[T_i, T_s_slow, T_s_fast, T_sensor, RH_sensor, m_H2O_vapor, Gc, m_fog, Vdot], [trans, evap]]  # x[k+1], abgeleitete_Groeßen[k+1]
     
 
     # Modell der Luftturbulenzen

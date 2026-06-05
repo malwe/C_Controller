@@ -8,8 +8,8 @@ import shared
 
 shared.simulation_time = 10000.0
 
-pid_controller = T_and_VPD_PID_Controller(DT)
-plgs_controller = PLGS_Controller(DT)
+pid_controller = T_and_VPD_PID_Controller()
+plgs_controller = PLGS_Controller()
 
 T_range = np.linspace(20, 30, 100)
 RH_range = np.linspace(30, 80, 100)
@@ -22,7 +22,7 @@ for iT, T in enumerate(T_range):
     for iRH, RH in enumerate(RH_range):
         shared.simulation_time += 100.0
         VPD = atmospheric_vpd_from_RH(T, RH)
-        u_f_p, u_h_p, _, _, _ = pid_controller.get_control_variables(T, VPD)
+        u_f_p, u_h_p, _, _, _ = pid_controller.get_control_variables(T, VPD, False)
         u_f_plgs, u_h_plgs = plgs_controller.get_control_variables(T, VPD, False)
         u_h_p_map[iT][iRH] = u_h_p
         u_h_plgs_map[iT][iRH] = u_h_plgs

@@ -73,7 +73,7 @@ class PID_Controller:
     
 
 class T_and_VPD_PID_Controller:
-    def __init__(self, dt):
+    def __init__(self):
 
         self.last_control_time = 0.0  # (s)
 
@@ -91,9 +91,9 @@ class T_and_VPD_PID_Controller:
         T_set = 25  # u_f_T = 0
         T_max = 29  # u_f_T = U_F_ON (in Realität 100%)
 
-        vpd_min = 1.05
+        vpd_min = 1.1
         vpd_set = 1.25
-        vpd_max = 1.35
+        vpd_max = 1.4
 
         # PID gains
         Kp_f_T = 1 / (T_max - T_set)
@@ -137,14 +137,16 @@ class T_and_VPD_PID_Controller:
         # self.fan_quantizer = Delta_Sigma_PWM(min_pwm_hold_time_fan)
         # self.humidifier_quantizer = Delta_Sigma_PWM(min_pwm_hold_time_humidifier)
 
-        min_quant_hold_time_fan = 1.0  # (s) Minimale Haltezeit des quantisierten Wertes
-        min_quant_hold_time_humidifier = 1.0
-        num_bits_quantizer = 3
-        self.fan_quantizer = Delta_Sigma_Quantizer(min_quant_hold_time_fan, num_bits_quantizer)
-        self.humidifier_quantizer = Delta_Sigma_Quantizer(min_quant_hold_time_humidifier, num_bits_quantizer)
+        # (s) Minimale Haltezeit des quantisierten Wertes - falls Abluft oder Humidifier nicht mit kontinuierlich schwankenden Werten klarkommen
+        min_quant_hold_time_fan = 0.4                 # (s) für Simulation evtl. besser als Vielfaches von shared.DT
+        min_quant_hold_time_humidifier = 0.4
+        levels_fan = np.linspace(0.0, U_F_ON, 8)      # diskrete Stufen für Abluft
+        levels_humidifier = np.array([0.0, U_H_ON])
+        self.fan_quantizer = Delta_Sigma_Quantizer(min_quant_hold_time_fan, levels_fan)
+        self.humidifier_quantizer = Delta_Sigma_Quantizer(min_quant_hold_time_humidifier, levels_humidifier)
 
     
-    def get_control_variables(self, T, VPD, f_pwm):
+    def get_control_variables(self, T, VPD, f_quant):
         e_f_T_raw = T - self.T_set
         e_vpd_raw = VPD - self.vpd_set
         e_f_vpd_raw = -e_vpd_raw
@@ -181,12 +183,12 @@ class T_and_VPD_PID_Controller:
 
         assert(self.u_f >= 0 and self.u_f <= 1 and self.u_h >= 0 and self.u_h <= 1)
 
-        if f_pwm:
-            fan_pwm_state = self.fan_quantizer.step(self.u_f / U_F_ON)  # PWM: kontinuierlich[0, 1] -> diskret{0, 1}
-            humidifier_pwm_state = self.humidifier_quantizer.step(self.u_h / U_H_ON)
+        if f_quant:
+            fan_quantizer_state = self.fan_quantizer.step(self.u_f / U_F_ON)
+            humidifier_quantizer_state = self.humidifier_quantizer.step(self.u_h / U_H_ON)
 
-            self.u_f = fan_pwm_state * U_F_ON
-            self.u_h = humidifier_pwm_state * U_H_ON
+            self.u_f = fan_quantizer_state
+            self.u_h = humidifier_quantizer_state
 
         return self.u_f, self.u_h
     
@@ -353,12 +355,13 @@ class Delta_Sigma_PWM:
 # first-order N-bit delta-sigma modulator with dwell-time-limited switching
 # rate-limited multi-level tracking quantizer
 class Delta_Sigma_Quantizer:
-    def __init__(self, min_hold_time, num_bits):
-        assert num_bits >= 1
+    def __init__(self, min_hold_time, levels):
+        # assert num_bits >= 1
 
-        self.num_bits = num_bits
-        self.num_levels = 2**num_bits
-        self.levels = np.linspace(0.0, 1.0, self.num_levels)
+        # self.num_bits = num_bits
+        # self.num_levels = 2**num_bits
+        # self.levels = np.linspace(0.0, 1.0, self.num_levels)
+        self.levels = levels
         self.min_hold_time = min_hold_time
 
         self.integrator = 0.0  # Fehlerzustand
@@ -379,7 +382,7 @@ class Delta_Sigma_Quantizer:
         self.last_integration_time = now
 
         if (now - self.last_switch_time) >= self.min_hold_time:
-            # keine Ahnung was korrekt ist - beides verhält sich ähnlich
+            # keine Ahnung was korrekt/ besser ist
             # Variante 1
             v = u_continuous + self.integrator
             # Variante 2

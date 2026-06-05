@@ -13,28 +13,26 @@ import shared
 
 sim = GrowZeltSim(DT)
 
-# tau_T_sensor und tau_RH_sensor frei geschätzt
-tau_T_sensor =  10.0   # (s)
-tau_RH_sensor = 10.0  # (s)
 # EMA-Filter:
 # y[i] = α x[i] + (1−α) y[i−1]
 # Y(z) = α X(z) + (1−α) z^−1 Y(z)
 # H(z) = Y(z)/X(z) = α / (1 - (1-α) z^-1)
 # -> Pol: z_p = (1-α)
 # Zeitdiskretes System mit Abtastzeit T_sampling: z_p = exp(-T_sampling / tau)
-T_SensorSampling = DT   # (s) MUSS identisch sein mit DT !!!
+T_SensorSampling = 0.2  # (s)
 alpha_EMA = 0.1         # (0-1)
 tau_T_EMA = tau_RH_EMA = -T_SensorSampling / np.log(1-alpha_EMA)
 # Sensorrauschen (frei geschätzt -> im Datenblatt suchen oder messen)
-sigma_T  = 0.04 / 3  # (K) SHT31 lt. Datenblatt (High Acc. Mode) Repeatability = 3 sigma = 0.04
-sigma_RH = 0.08 / 3   # (%) SHT31 lt. Datenblatt (High Acc. Mode) Repeatability = 3 sigma = 0.08
-sensor = SensorDynamics(DT, tau_T_sensor, tau_RH_sensor, tau_T_EMA, tau_RH_EMA, sigma_T, sigma_RH)
+sigma_T  = 0.04 / 3.0  # (K) SHT31 lt. Datenblatt (High Acc. Mode) Repeatability = 3 sigma = 0.04
+sigma_RH = 0.08 / 3.0   # (%) SHT31 lt. Datenblatt (High Acc. Mode) Repeatability = 3 sigma = 0.08
+sensor = SensorDynamics(DT, tau_T_EMA, tau_RH_EMA, sigma_T, sigma_RH)
 
 # Initialzustand des Sensors im Zelt
 sensor.init(T0=25.0, RH0=50.0)
 
 # Initialzustand des Systems Zelt
-x = np.array([25.0, 25.0, 25.0, 0.015, 0.0, 0.0])  # T_i, T_s_slow, T_s_fast, m_H2O_vapor(kg), Gc(kg/s/kPa), m_fog(kg)
+# T_i, T_s_slow, T_s_fast, T_sensor, RH_sensor, m_H2O_vapor(kg), Gc(kg/s/kPa), m_fog(kg), Vdot(m^3/s)
+x = np.array([25.0, 25.0, 25.0, 25.0, 50.0, 0.015, 0.0, 0.0, 0.0])
 
 # Zeitreihe
 simulation_duration = 10 * 3600.0  # s
@@ -56,35 +54,38 @@ class HistoryRows(Enum):
     T_i = 0
     T_s_slow = 1
     T_s_fast = 2
-    m_H2O_vapor = 3
-    Gc = 4
-    m_fog = 5
+    T_sensor = 3
+    RH_sensor = 4
+    m_H2O_vapor = 5
+    Gc = 6
+    m_fog = 7
+    Vdot = 8
     # Stellgrößen
-    u_f = 6
-    u_h = 7
+    u_f = 9
+    u_h = 10
     # Sensorwerte (später evtl als Zustände modellieren)
-    T_meas = 8
-    RH_meas = 9
+    T_meas = 11
+    RH_meas = 12
     # Abgeleitete Größen
-    w_i = 10
-    RH_i = 11
-    VPD_atm_i = 12
-    VPD_atm_meas = 13
-    trans = 14
-    evap = 15
+    w_i = 13
+    RH_i = 14
+    VPD_atm_i = 15
+    VPD_atm_meas = 16
+    trans = 17
+    evap = 18
     # Reglerzustände/ -debugging
-    D_f_T = 16
-    D_f_vpd = 17
-    D_h_vpd = 18
+    D_f_T = 19
+    D_f_vpd = 20
+    D_h_vpd = 21
     #
-    LENGTH_PLUS_ONE = 19
+    LENGTH_PLUS_ONE = 22
 
 history = np.full((HistoryRows.LENGTH_PLUS_ONE.value, N), np.nan)  # Zeilen: Historie der Größen, Spalten: Zeitschritte
 
 
 bang_bang_controller = Bang_Bang_Controller()
 plgs_controller = PLGS_Controller()
-pid_controller = T_and_VPD_PID_Controller(DT)
+pid_controller = T_and_VPD_PID_Controller()
 
 trans = float('NaN')
 evap = float('NaN')
@@ -98,20 +99,18 @@ for k in range(N):
     # Störgrößen (erstmal hardcoded, später Messwerte)
     d = [T_o[k], w_o[k], LED[k]]  # d[k]
 
-    T_i, T_s_slow, T_s_fast, m_H2O_vapor, Gc, m_fog = x
+    T_i, T_s_slow, T_s_fast, T_sensor, RH_sensor, m_H2O_vapor, Gc, m_fog, Vdot = x
 
     # Abgeleitete Größen für Plot
     w_i = m_H2O_vapor / sim.V  # absolute Feuchte (kg/m^3)
     RH_i = RH_from_abs_hum(T_i, w_i)  # relative Feuchte (0-100 %)
 
-    # Simulation der Sensorwerte mit Sensor-Dynamik
-    T_meas, RH_meas = sensor.step(T_i, RH_i)
+    # Simulation der Messwerte (Rauschen + EMA)
+    T_meas, RH_meas = sensor.step(T_sensor, RH_sensor)
 
     VPD_atm_i = atmospheric_vpd_from_RH(T_i, RH_i)
     VPD_atm_meas = atmospheric_vpd_from_RH(T_meas, RH_meas)
 
-    # Stellgrößen (hardcoded)
-    # u = [u_f[k], u_h[k]]
     # Stellgrößen (Regler)
     # u_f, u_h = bang_bang_controller.get_control_variables(T_meas, VPD_atm_meas)  # u[k]
     # u_f, u_h = plgs_controller.get_control_variables(T_meas, VPD_atm_meas, False)  # u[k]
@@ -120,11 +119,11 @@ for k in range(N):
 
     D_f_T, D_f_vpd, D_h_vpd = pid_controller.get_D_filtered()
 
-    history[:, k] = [T_i, T_s_slow, T_s_fast, m_H2O_vapor, Gc, m_fog, u_f, u_h, \
+    history[:, k] = [T_i, T_s_slow, T_s_fast, T_sensor, RH_sensor, m_H2O_vapor, Gc, m_fog, Vdot, u_f, u_h, \
                      T_meas, RH_meas, w_i, RH_i, VPD_atm_i, VPD_atm_meas, trans, evap, D_f_T, D_f_vpd, D_h_vpd]
 
     # Simulation des nächsten Zeitschritts
-    x, [trans, evap] = sim.step(x, u, d)  # x[k], u[k], z[k] -> x[k+1] 
+    x, [trans, evap] = sim.step(x, u, d, False)  # x[k], u[k], z[k] -> x[k+1] 
 
 
 # -------------------------
@@ -172,6 +171,7 @@ axes_1d[1].plot(t, history[HistoryRows.T_i.value, first:], label='T_i', color='t
 axes_1d[1].plot(t, T_o[first:], label='T_o', color='tab:cyan', linestyle=':')
 axes_1d[1].plot(t, history[HistoryRows.T_s_slow.value, first:], label='T_s_slow', color='tab:gray')
 axes_1d[1].plot(t, history[HistoryRows.T_s_fast.value, first:], label='T_s_fast', color='tab:pink')
+axes_1d[1].plot(t, history[HistoryRows.T_sensor.value, first:], label='T_sensor', color='tab:purple')
 axes_1d[1].plot(t, history[HistoryRows.T_meas.value, first:], label='T_meas', color='tab:red')
 axes_1d[1].plot(t, history[HistoryRows.D_f_T.value, first:], label='D_f_T', color='tab:green')
 axes_1d[1].set_ylabel('Temperature (°C)')
@@ -181,6 +181,7 @@ axes_1d[1].grid(True, linestyle=':', alpha=0.5)
 # Plot 1D: Relative Luftfeuchtigkeiten
 axes_1d[2].plot(t, history[HistoryRows.RH_i.value, first:], label='RH_i', color='tab:orange', linestyle='--')
 axes_1d[2].plot(t, RH_o[first:], label='RH_o', color='tab:cyan', linestyle=':')
+axes_1d[2].plot(t, history[HistoryRows.RH_sensor.value, first:], label='RH_sensor', color='tab:purple')
 axes_1d[2].plot(t, history[HistoryRows.RH_meas.value, first:], label='RH_meas', color='tab:red')
 axes_1d[2].set_ylabel('RH (%)')
 axes_1d[2].legend(loc='upper right', fontsize='small')

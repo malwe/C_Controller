@@ -1,7 +1,8 @@
 # Es muss mindestens gelten für Euler-Integration: DT / tau_min < 0.3
 # EMA: T_sampling = 0.2 s ; alpha = 0.1 => tau_EMA = -T_sampling/ln(1 - alpha) = 1.9 s
-# => DT < 0.57
-DT = 0.20  # Zeitschritt der Simulation (s) MUSS identisch sein mit T_sampling der Sensoren !!!
+# => DT < 0.57 s
+# Abluft: tau = 2 s => DT < 0.6 s
+DT = 0.20  # Zeitschritt der Simulation (s)
 
 # Einstellungen an Aktoren
 U_F_ON = 0.35           # Eingestellte Lüfterleistung (0-1)
