@@ -139,11 +139,13 @@ class T_and_VPD_PID_Controller:
 
         # (s) Minimale Haltezeit des quantisierten Wertes - falls Abluft oder Humidifier nicht mit kontinuierlich schwankenden Werten klarkommen
         min_quant_hold_time_fan = 0.4                 # (s) für Simulation evtl. besser als Vielfaches von shared.DT
-        min_quant_hold_time_humidifier = 0.4
-        levels_fan = np.linspace(0.0, U_F_ON, 8)      # diskrete Stufen für Abluft
-        levels_humidifier = np.array([0.0, U_H_ON])
-        self.fan_quantizer = Delta_Sigma_Quantizer(min_quant_hold_time_fan, levels_fan)
-        self.humidifier_quantizer = Delta_Sigma_Quantizer(min_quant_hold_time_humidifier, levels_humidifier)
+        min_quant_hold_time_humidifier = 1.0
+        # levels_fan = np.linspace(0.0, U_F_ON, 8)      # diskrete Stufen für Abluft
+        # levels_humidifier = np.array([0.0, U_H_ON])
+        # self.fan_quantizer = Delta_Sigma_Quantizer(min_quant_hold_time_fan, levels_fan)
+        # self.humidifier_quantizer = Delta_Sigma_Quantizer(min_quant_hold_time_humidifier, levels_humidifier)
+        self.fan_quantizer = Delta_Sigma_PWM(min_quant_hold_time_fan)
+        self.humidifier_quantizer = Delta_Sigma_PWM(min_quant_hold_time_humidifier)
 
     
     def get_control_variables(self, T, VPD, f_quant):
